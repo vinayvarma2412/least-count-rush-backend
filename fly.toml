@@ -1,0 +1,24 @@
+# fly.toml app configuration file generated for leastcountrush on 2026-07-25T15:20:53Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = "leastcountrush"
+primary_region = "sin"
+
+[http_service]
+auto_start_machines = true
+auto_stop_machines = true
+force_https = true
+internal_port = 8080
+min_machines_running = 1
+processes = ['app']
+
+
+[[vm]]
+  cpu_kind = 'shared'
+  cpus = 1
+  memory = '1gb'
+  memory_mb = 1024
+  processes = ['app']
+  size = 'shared-cpu-1x'

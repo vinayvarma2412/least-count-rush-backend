@@ -1,0 +1,19 @@
+# fly.toml app configuration file generated for least-count-valkey on 2026-06-27T17:03:39+05:30
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'least-count-valkey'
+primary_region = 'bom'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[[mounts]]
+  source = 'valkey_data'
+  destination = '/data'
+
+[[vm]]
+  memory_mb = 256
+  cpu_kind = 'shared'
+  cpus = 1
