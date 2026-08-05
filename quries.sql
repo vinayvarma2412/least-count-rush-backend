@@ -4,9 +4,17 @@ where user_idn = 20;
 
 
 select *
-from users
-where user_idn = 20;
+from user_devices
+where user_idn = 19;
 
+
+select *
+from users
+where user_idn = 19;
+
+-- UPDATE users
+-- set role = 'admin'
+-- where user_idn = 19;
 
 select *
 from game_players

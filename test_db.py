@@ -1,12 +1,11 @@
 import asyncio
-from app.database import AsyncSessionLocal
-from app.services.online_game_stats_service import online_game_stats_service
+from app.database import async_session_maker
+from sqlalchemy import text
 
-async def run():
-    async with AsyncSessionLocal() as db:
-        print("Got db session")
-        firebase_uids = ["nsl3m6k5ICU4KqaaPmqhRYVjHdU2", "UxaKfsMwqSe7aosoxgtzB3QKDNw2"]
-        res = await online_game_stats_service.resolve_user_idns(db, firebase_uids)
-        print("Result:", res)
+async def main():
+    async with async_session_maker() as session:
+        result = await session.execute(text("SELECT user_idn, platform, fcm_token FROM user_devices"))
+        for row in result.all():
+            print(f"User: {row[0]}, Platform: {row[1]}, Token: {row[2][:15]}...")
 
-asyncio.run(run())
+asyncio.run(main())

@@ -8,7 +8,8 @@ import logging
 
 from app.database import get_db_session
 from app.api.dependencies import get_current_db_user
-from app.models.db_models import User, Message, MessageTypeEnum
+from app.models.db_models import User, Message, MessageTypeEnum, UserDevice
+from app.services import fcm_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/messages", tags=["messages"])
@@ -60,6 +61,29 @@ async def send_message(
     db.add(new_message)
     await db.commit()
     await db.refresh(new_message)
+    
+    # ── Push notification to recipient ──────────────────────────────────────
+    try:
+        tokens_result = await db.execute(
+            select(UserDevice.fcm_token).where(
+                UserDevice.user_idn == req.to_user_idn,
+                UserDevice.entity_active == True,
+                UserDevice.fcm_token.isnot(None),
+            )
+        )
+        tokens = [row[0] for row in tokens_result.all() if row[0]]
+        if tokens:
+            sender_name = user.display_name or f"User #{user.user_idn}"
+            preview = req.content[:80] + ("…" if len(req.content) > 80 else "")
+            fcm_service.send_to_tokens(
+                tokens,
+                title=f"New message from {sender_name}",
+                body=preview,
+                data={"type": "chat", "from_user_idn": str(user.user_idn)},
+            )
+    except Exception as fcm_exc:
+        logger.warning("send_message_fcm_failed", extra={"error": str(fcm_exc)})
+    # ────────────────────────────────────────────────────────────────────────
     
     return MessageResponse(
         message_idn=new_message.message_idn,

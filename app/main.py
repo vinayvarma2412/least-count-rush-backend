@@ -89,6 +89,7 @@ app.include_router(user_game_stats.router)
 app.include_router(leaderboard.router, prefix="/leaderboard", tags=["Leaderboard"])
 app.include_router(messages.router)
 app.include_router(admin.router)
+app.include_router(admin.firebase_router)  # Firebase-auth protected admin routes
 app.include_router(notifications.router)
 app.include_router(ads.router)
 app.include_router(ads.admin_router)

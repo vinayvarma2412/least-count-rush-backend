@@ -72,6 +72,7 @@ async def sync_user(
         "user_name": user.user_name,
         "displayName": user.display_name,
         "avatarSeed": user.avatar_seed,
+        "role": user.role.value if user.role else "user",
     }
 
 @router.get("/me")

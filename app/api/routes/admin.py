@@ -7,12 +7,121 @@ from typing import List, Optional
 import logging
 
 from app.database import get_db_session
-from app.api.dependencies import get_admin_api_key
-from app.models.db_models import User, Message, MessageTypeEnum, UserDevice
+from app.api.dependencies import get_admin_api_key, get_current_db_user
+from app.models.db_models import User, Message, MessageTypeEnum, UserDevice, Game, GameResultEnum, UserRoleEnum
 from app.services import fcm_service
 
 logger = logging.getLogger(__name__)
+
+# ── Existing router: protected by X-Admin-API-Key header ─────────────────────
 router = APIRouter(prefix="/api/admin", tags=["Admin"], dependencies=[Depends(get_admin_api_key)])
+
+# ── New router: protected by Firebase auth + admin role ───────────────────────
+firebase_router = APIRouter(prefix="/api/admin", tags=["Admin Dashboard"])
+
+
+class AdminStatsResponse(BaseModel):
+    users_online: int
+    games_in_progress: int
+    games_completed: int
+    games_cancelled: int
+    games_total_today: int
+    unread_messages: int
+    total_users: int
+
+
+async def _require_admin(current_user: User = Depends(get_current_db_user)) -> User:
+    """Dependency that ensures the authenticated user has the 'admin' role."""
+    if current_user.role != UserRoleEnum.admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required",
+        )
+    return current_user
+
+
+@firebase_router.get("/dashboard/stats", response_model=AdminStatsResponse)
+async def get_dashboard_stats(
+    admin_user_idn: int,
+    current_user: User = Depends(_require_admin),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Aggregate dashboard statistics for the admin app.
+    Protected by Firebase authentication + admin role check.
+    admin_user_idn is the DB idn of the admin, used to count unread messages.
+    """
+    from datetime import date, timedelta
+    from sqlalchemy import cast, Date as SADate
+
+    # Users online
+    users_online_result = await db.execute(
+        select(func.count()).where(User.is_online == True, User.entity_active == True)
+    )
+    users_online = users_online_result.scalar() or 0
+
+    # Total users
+    total_users_result = await db.execute(
+        select(func.count()).where(User.entity_active == True)
+    )
+    total_users = total_users_result.scalar() or 0
+
+    # Games in progress
+    games_in_progress_result = await db.execute(
+        select(func.count()).where(
+            Game.result == GameResultEnum.in_progress,
+            Game.entity_active == True,
+        )
+    )
+    games_in_progress = games_in_progress_result.scalar() or 0
+
+    # Games completed
+    games_completed_result = await db.execute(
+        select(func.count()).where(
+            Game.result == GameResultEnum.completed,
+            Game.entity_active == True,
+        )
+    )
+    games_completed = games_completed_result.scalar() or 0
+
+    # Games cancelled
+    games_cancelled_result = await db.execute(
+        select(func.count()).where(
+            Game.result == GameResultEnum.cancelled,
+            Game.entity_active == True,
+        )
+    )
+    games_cancelled = games_cancelled_result.scalar() or 0
+
+    # Games total today
+    today = datetime.now(timezone.utc).date()
+    games_today_result = await db.execute(
+        select(func.count()).where(
+            Game.entity_active == True,
+            func.date(Game.crt_dt) == today,
+        )
+    )
+    games_total_today = games_today_result.scalar() or 0
+
+    # Unread messages for admin
+    unread_result = await db.execute(
+        select(func.count()).where(
+            Message.to_user_idn == admin_user_idn,
+            Message.read_at.is_(None),
+            Message.entity_active == True,
+        )
+    )
+    unread_messages = unread_result.scalar() or 0
+
+    return AdminStatsResponse(
+        users_online=users_online,
+        games_in_progress=games_in_progress,
+        games_completed=games_completed,
+        games_cancelled=games_cancelled,
+        games_total_today=games_total_today,
+        unread_messages=unread_messages,
+        total_users=total_users,
+    )
 
 class AdminReplyRequest(BaseModel):
     admin_user_idn: int
@@ -37,9 +146,10 @@ class ConversationResponse(BaseModel):
     last_message_dt: datetime
     unread_count: int
 
-@router.get("/messages/conversations", response_model=List[ConversationResponse])
+@firebase_router.get("/messages/conversations", response_model=List[ConversationResponse])
 async def get_conversations(
     admin_user_idn: int,
+    current_user: User = Depends(_require_admin),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
@@ -90,12 +200,13 @@ async def get_conversations(
     
     return conv_list
 
-@router.get("/messages/{user_idn}", response_model=List[MessageResponse])
+@firebase_router.get("/messages/{user_idn}", response_model=List[MessageResponse])
 async def get_chat_history(
     user_idn: int,
     admin_user_idn: int,
     limit: int = 50,
     offset: int = 0,
+    current_user: User = Depends(_require_admin),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
@@ -111,12 +222,12 @@ async def get_chat_history(
     result = await db.execute(stmt)
     messages = result.scalars().all()
     
-    # Return in chronological order
-    return messages[::-1]
+    return messages
 
-@router.post("/messages/reply", response_model=MessageResponse)
+@firebase_router.post("/messages/reply", response_model=MessageResponse)
 async def reply_to_user(
     req: AdminReplyRequest,
+    current_user: User = Depends(_require_admin),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
@@ -168,3 +279,29 @@ async def reply_to_user(
     # ────────────────────────────────────────────────────────────────────────
 
     return new_msg
+
+
+class MarkReadResponse(BaseModel):
+    success: bool
+    marked_count: int
+
+@firebase_router.post("/messages/{user_idn}/read", response_model=MarkReadResponse)
+async def mark_messages_read(
+    user_idn: int,
+    admin_user_idn: int,
+    current_user: User = Depends(_require_admin),
+    db: AsyncSession = Depends(get_db_session)
+):
+    """
+    Mark all unread messages from a specific user as read by the admin.
+    """
+    from sqlalchemy import update
+    stmt = update(Message).where(
+        Message.from_user_idn == user_idn,
+        Message.to_user_idn == admin_user_idn,
+        Message.read_at.is_(None)
+    ).values(read_at=datetime.now(timezone.utc))
+    
+    result = await db.execute(stmt)
+    await db.commit()
+    return MarkReadResponse(success=True, marked_count=result.rowcount)
