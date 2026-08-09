@@ -105,23 +105,7 @@ async def websocket_presence(websocket: WebSocket, token: str = ""):
 
 from fastapi import Depends, HTTPException
 
-async def check_machine_routing(room_id: str):
-    """Check if the room is hosted on another machine and replay if necessary."""
-    room = await room_service.get_room(room_id)
-    if room and room.host_machine_id:
-        current_machine = os.environ.get("FLY_MACHINE_ID")
-        if current_machine and room.host_machine_id != current_machine:
-            global_log.info("fly_replay_triggered", {
-                "room_id": room_id,
-                "target_machine": room.host_machine_id,
-                "current_machine": current_machine
-            })
-            raise HTTPException(
-                status_code=409,
-                headers={"fly-replay": f"instance={room.host_machine_id}"}
-            )
-
-@app.websocket("/ws/{room_id}", dependencies=[Depends(check_machine_routing)])
+@app.websocket("/ws/{room_id}")
 async def websocket_room(websocket: WebSocket, room_id: str, token: str = ""):
     """WebSocket endpoint for room connections"""
     await room_ws.websocket_endpoint(websocket, room_id, token)

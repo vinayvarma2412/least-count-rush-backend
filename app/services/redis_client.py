@@ -208,3 +208,7 @@ if USE_REDIS:
     )
 else:
     redis_client: Any = _MemoryStore()
+
+# ── Dedicated Memory Store ──────────────────────────────────────────────────
+# Used by game_service to store fast, zero-latency state regardless of USE_REDIS
+memory_store: _MemoryStore = _MemoryStore()

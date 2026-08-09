@@ -114,7 +114,7 @@ class RoomService:
             "score_limit": room_data.score_limit,
             "creator_app_version": room_data.creator_app_version,
             "creator_build_number": room_data.creator_build_number,
-            "host_machine_id": os.getenv("FLY_MACHINE_ID"),
+            "server_url": os.getenv("PUBLIC_SERVER_URL"),
             "status": RoomStatus.WAITING,
             "created_at": datetime.now(timezone.utc),
         }

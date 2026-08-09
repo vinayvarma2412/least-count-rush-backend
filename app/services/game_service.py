@@ -29,7 +29,7 @@ from app.utils.game_rules import (
     can_skip_draw,
     remove_cards_from_hand,
 )
-from app.services.redis_client import redis_client, KEY_TTL_SECONDS
+from app.services.redis_client import memory_store as game_store, KEY_TTL_SECONDS
 from app.config import TURN_TIMEOUT_SECONDS, PLAYER_LIVES, BOT_PLAY_ANIMATION_DELAY_MS
 
 
@@ -53,10 +53,10 @@ class GameService:
         return f"game:{room_id}"
 
     async def _save(self, room_id: str, gs: GameState) -> None:
-        await redis_client.setex(self._key(room_id), KEY_TTL_SECONDS, _game_state_to_json(gs))
+        await game_store.setex(self._key(room_id), KEY_TTL_SECONDS, _game_state_to_json(gs))
 
     async def _load(self, room_id: str) -> Optional[GameState]:
-        raw = await redis_client.get(self._key(room_id))
+        raw = await game_store.get(self._key(room_id))
         if raw is None:
             return None
         return _game_state_from_json(raw)
@@ -320,10 +320,10 @@ class GameService:
 
     async def clear_game(self, room_id: str):
         """Clear game state for a room."""
-        exists = await redis_client.exists(self._key(room_id))
+        exists = await game_store.exists(self._key(room_id))
         if exists:
             get_room_logger(room_id).info("game_state_cleared", {})
-        await redis_client.delete(self._key(room_id))
+        await game_store.delete(self._key(room_id))
 
     async def _create_turn_context(self, room_id: str):
         """Create a fresh TurnContext for the current player's turn."""

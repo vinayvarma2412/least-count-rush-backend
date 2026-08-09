@@ -84,9 +84,9 @@ class RoomResponse(BaseModel):
         default=None,
         description="Build number of the room creator (e.g. '22')",
     )
-    host_machine_id: Optional[str] = Field(
+    server_url: Optional[str] = Field(
         default=None,
-        description="Fly.io machine ID where this room was created and is hosted"
+        description="Public URL of the server where this room is hosted"
     )
     status: RoomStatus
     created_at: datetime
