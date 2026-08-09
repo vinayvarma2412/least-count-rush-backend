@@ -88,6 +88,10 @@ class RoomResponse(BaseModel):
         default=None,
         description="Public URL of the server where this room is hosted"
     )
+    server_region: Optional[str] = Field(
+        default=None,
+        description="Region of the server where this room is hosted (e.g. 'bom', 'lax')"
+    )
     status: RoomStatus
     created_at: datetime
 

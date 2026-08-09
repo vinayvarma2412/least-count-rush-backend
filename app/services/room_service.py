@@ -115,6 +115,7 @@ class RoomService:
             "creator_app_version": room_data.creator_app_version,
             "creator_build_number": room_data.creator_build_number,
             "server_url": os.getenv("PUBLIC_SERVER_URL"),
+            "server_region": os.getenv("FLY_REGION"),
             "status": RoomStatus.WAITING,
             "created_at": datetime.now(timezone.utc),
         }
