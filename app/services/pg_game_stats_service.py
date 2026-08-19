@@ -64,6 +64,34 @@ class PgGameStatsService:
                 if status_str == "cancelled":
                     game_result = GameResultEnum.cancelled
 
+                client_game_id = stat.get("id")
+
+                # Check if game already exists for idempotency
+                existing_game = None
+                if client_game_id:
+                    result = await db.execute(
+                        select(Game).where(Game.created_user_idn == user_idn, Game.client_game_id == str(client_game_id))
+                    )
+                    existing_game = result.scalar_one_or_none()
+
+                if existing_game:
+                    # Update existing game
+                    existing_game.result = game_result
+                    existing_game.total_rounds = stat.get("roundsPlayed", 0)
+                    existing_game.winner_user_idn = winner_user_idn
+                    existing_game.duration_seconds = stat.get("durationSeconds")
+                    
+                    # Update game player
+                    result = await db.execute(
+                        select(GamePlayer).where(GamePlayer.game_idn == existing_game.game_idn, GamePlayer.user_idn == user_idn)
+                    )
+                    existing_player = result.scalar_one_or_none()
+                    if existing_player:
+                        existing_player.final_score = stat.get("playerScore", 0)
+                        existing_player.rank_position = rank
+                        existing_player.rounds_survived = stat.get("roundsSurvived", 0)
+                    continue
+
                 # Create Game
                 game = Game(
                     game_type=GameTypeEnum.offline,  # Bot games are offline
@@ -76,8 +104,8 @@ class PgGameStatsService:
                     started_at=started_at,
                     ended_at=started_at,  # Approximate
                     duration_seconds=stat.get("durationSeconds"),
-                    score_limit=stat.get("scoreLimit", "")
-
+                    score_limit=stat.get("scoreLimit", ""),
+                    client_game_id=str(client_game_id) if client_game_id else None
                 )
                 db.add(game)
                 await db.flush()  # To get game.game_idn
@@ -124,7 +152,7 @@ class PgGameStatsService:
         result = await db.execute(
             query
             .options(joinedload(Game.winner), joinedload(Game.players).joinedload(GamePlayer.user))
-            .order_by(Game.crt_dt.desc())
+            .order_by(Game.started_at.desc())
             .limit(limit)
             .offset(offset)
         )

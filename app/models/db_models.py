@@ -185,7 +185,12 @@ class Game(Base):
     ended_at = Column(DateTime(timezone=True), nullable=True)
     duration_seconds = Column(Integer, nullable=True)
     entity_active = Column(Boolean, default=True)
+    client_game_id = Column(String(100), nullable=True)
     crt_dt = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("created_user_idn", "client_game_id", name="uq_user_client_game"),
+    )
 
     winner = relationship("User", foreign_keys=[winner_user_idn], back_populates="games_won")
     creator = relationship("User", foreign_keys=[created_user_idn], back_populates="games_created")
