@@ -4,14 +4,14 @@
 #
 
 app = "leastcountrush"
-primary_region = "lax"
+primary_region = "bom"
 
 [http_service]
 auto_start_machines = true
-auto_stop_machines = false
+auto_stop_machines = true
 force_https = true
 internal_port = 8080
-min_machines_running = 2
+min_machines_running = 1
 processes = ['app']
 
 [[vm]]
