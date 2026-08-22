@@ -3,15 +3,15 @@
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = "leastcountrush"
+app = "leastcountrush-lax"
 primary_region = "lax"
 
 [http_service]
 auto_start_machines = true
-auto_stop_machines = false
+auto_stop_machines = true
 force_https = true
 internal_port = 8080
-min_machines_running = 2
+min_machines_running = 1
 processes = ['app']
 
 [[vm]]
