@@ -97,7 +97,10 @@ def send_to_tokens(
     Returns (success_count, failure_count).
     """
     if not _ADMIN_READY or not tokens:
-        return 0, len(tokens)
+        return 0, 0 if not tokens else len(tokens)
+
+    # Deduplicate to prevent sending multiple notifications to the same device
+    tokens = list(set(tokens))
 
     # FCM multicast limit is 500 tokens per call
     success_total, failure_total = 0, 0
