@@ -9,20 +9,33 @@ logger = logging.getLogger(__name__)
 
 class RemoteConfigService:
     def __init__(self):
-        sa_key_path = os.environ.get(
-            "GOOGLE_APPLICATION_CREDENTIALS",
-            os.path.join(os.path.dirname(__file__), "..", "..", "serviceAccountKey.json"),
-        )
-        self.sa_key_path = os.path.normpath(sa_key_path)
         self._creds = None
         self.project_id = None
 
     def _get_credentials(self):
         if not self._creds:
-            self._creds = service_account.Credentials.from_service_account_file(
-                self.sa_key_path,
-                scopes=['https://www.googleapis.com/auth/firebase.remoteconfig']
-            )
+            cred_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+            cred_b64 = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_BASE64")
+            
+            if cred_b64 or cred_json:
+                import json
+                import base64
+                content = base64.b64decode(cred_b64).decode('utf-8') if cred_b64 else (cred_json or "")
+                info = json.loads(content)
+                self._creds = service_account.Credentials.from_service_account_info(
+                    info,
+                    scopes=['https://www.googleapis.com/auth/firebase.remoteconfig']
+                )
+            else:
+                sa_key_path = os.environ.get(
+                    "GOOGLE_APPLICATION_CREDENTIALS",
+                    os.path.join(os.path.dirname(__file__), "..", "..", "serviceAccountKey.json"),
+                )
+                sa_key_path = os.path.normpath(sa_key_path)
+                self._creds = service_account.Credentials.from_service_account_file(
+                    sa_key_path,
+                    scopes=['https://www.googleapis.com/auth/firebase.remoteconfig']
+                )
             self.project_id = self._creds.project_id
         # Refresh if needed
         if not self._creds.valid:

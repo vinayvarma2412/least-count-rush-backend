@@ -30,19 +30,31 @@ def _init_firebase_admin() -> bool:
     except ValueError:
         pass
 
-    # Prefer GOOGLE_APPLICATION_CREDENTIALS env var (Cloud Run / EC2 IAM),
-    # fall back to the serviceAccountKey.json in the backend directory.
-    sa_key_path = os.environ.get(
-        "GOOGLE_APPLICATION_CREDENTIALS",
-        os.path.join(os.path.dirname(__file__), "..", "..", "serviceAccountKey.json"),
-    )
-    sa_key_path = os.path.normpath(sa_key_path)
+    # Prefer GOOGLE_APPLICATION_CREDENTIALS_JSON or BASE64 env var
+    cred_b64 = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_BASE64")
+    cred_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
 
     try:
-        cred = credentials.Certificate(sa_key_path)
-        firebase_admin.initialize_app(cred)
-        logger.info("firebase_admin_initialized", extra={"key_path": sa_key_path})
-        return True
+        if cred_b64 or cred_json:
+            import json
+            import base64
+            content = base64.b64decode(cred_b64).decode('utf-8') if cred_b64 else (cred_json or "")
+            cert_dict = json.loads(content)
+            cred = credentials.Certificate(cert_dict)
+            firebase_admin.initialize_app(cred)
+            logger.info("firebase_admin_initialized", extra={"source": "env_json_or_b64"})
+            return True
+        else:
+            sa_key_path = os.environ.get(
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                os.path.join(os.path.dirname(__file__), "..", "..", "serviceAccountKey.json"),
+            )
+            sa_key_path = os.path.normpath(sa_key_path)
+
+            cred = credentials.Certificate(sa_key_path)
+            firebase_admin.initialize_app(cred)
+            logger.info("firebase_admin_initialized", extra={"key_path": sa_key_path})
+            return True
     except Exception as exc:
         logger.error("firebase_admin_init_failed", extra={"error": str(exc)})
         return False

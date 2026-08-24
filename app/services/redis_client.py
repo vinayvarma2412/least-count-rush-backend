@@ -179,6 +179,20 @@ class _MemoryStore:
                     removed += 1
             return removed
 
+    async def keys(self, pattern: str = "*") -> list[str]:
+        async with self._lock:
+            # Basic wildcard support for * only, sufficient for simple matching
+            import fnmatch
+            return [
+                k for k in self._data.keys()
+                if not self._is_expired(k) and fnmatch.fnmatch(k, pattern)
+            ]
+
+    async def flushdb(self) -> None:
+        async with self._lock:
+            self._data.clear()
+            self._sets.clear()
+
     def pipeline(self) -> "_MemoryPipeline":
         return _MemoryPipeline(self)
 

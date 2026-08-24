@@ -11,6 +11,7 @@ from app.database import get_db_session
 from app.api.dependencies import get_admin_api_key, get_current_db_user, _require_admin
 from app.models.db_models import User, Message, MessageTypeEnum, UserDevice, Game, GameResultEnum, UserRoleEnum
 from app.services import fcm_service
+from app.services.redis_client import redis_client
 
 logger = logging.getLogger(__name__)
 
@@ -341,3 +342,52 @@ async def update_remote_config(
     except Exception as e:
         logger.error(f"Error updating remote config: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+@firebase_router.get("/redis", response_model=list[dict])
+async def get_redis_data(
+    current_user: User = Depends(_require_admin)
+):
+    try:
+        keys = await redis_client.keys("*")
+        # Limit to 1000 to prevent overwhelming
+        keys = list(keys)[:1000]
+        
+        data = []
+        for k in keys:
+            # We don't know the exact type (string, set, hash), so we try to get it.
+            # `type` command in Redis returns type name. But aioredis handles it.
+            # For simplicity, we just fetch string or members if it's a set.
+            # In memory store, we don't have a robust type() method. 
+            # We will just try to get string value, if it's a set it might fail or we can catch it.
+            # Actually, `redis_client.get` returns None if it's a set in aioredis.
+            # Let's try to get string value.
+            val_str = None
+            try:
+                val = await redis_client.get(k)
+                if val is not None:
+                    val_str = str(val)
+                else:
+                    # Might be a set
+                    members = await redis_client.smembers(k)
+                    if members:
+                        val_str = f"Set: {members}"
+            except Exception:
+                val_str = "<Complex Data Type>"
+                
+            data.append({"key": k, "value": val_str})
+        return data
+    except Exception as e:
+        logger.error(f"Error fetching redis data: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@firebase_router.delete("/redis")
+async def clear_redis_data(
+    current_user: User = Depends(_require_admin)
+):
+    try:
+        await redis_client.flushdb()
+        return {"status": "success", "message": "Redis database cleared."}
+    except Exception as e:
+        logger.error(f"Error clearing redis: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
