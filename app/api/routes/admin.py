@@ -3,11 +3,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, and_, func, desc
 from pydantic import BaseModel
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import logging
+import httpx
 
 from app.database import get_db_session
-from app.api.dependencies import get_admin_api_key, get_current_db_user
+from app.api.dependencies import get_admin_api_key, get_current_db_user, _require_admin
 from app.models.db_models import User, Message, MessageTypeEnum, UserDevice, Game, GameResultEnum, UserRoleEnum
 from app.services import fcm_service
 
@@ -28,16 +29,7 @@ class AdminStatsResponse(BaseModel):
     games_total_today: int
     unread_messages: int
     total_users: int
-
-
-async def _require_admin(current_user: User = Depends(get_current_db_user)) -> User:
-    """Dependency that ensures the authenticated user has the 'admin' role."""
-    if current_user.role != UserRoleEnum.admin:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin access required",
-        )
-    return current_user
+    active_users_today: int
 
 
 @firebase_router.get("/dashboard/stats", response_model=AdminStatsResponse)
@@ -65,6 +57,17 @@ async def get_dashboard_stats(
         select(func.count()).where(User.entity_active == True)
     )
     total_users = total_users_result.scalar() or 0
+
+    today = datetime.now(timezone.utc).date()
+
+    # Active users today
+    active_users_today_result = await db.execute(
+        select(func.count()).where(
+            User.entity_active == True,
+            func.date(User.last_active_date) == today,
+        )
+    )
+    active_users_today = active_users_today_result.scalar() or 0
 
     # Games in progress
     games_in_progress_result = await db.execute(
@@ -94,7 +97,6 @@ async def get_dashboard_stats(
     games_cancelled = games_cancelled_result.scalar() or 0
 
     # Games total today
-    today = datetime.now(timezone.utc).date()
     games_today_result = await db.execute(
         select(func.count()).where(
             Game.entity_active == True,
@@ -121,6 +123,7 @@ async def get_dashboard_stats(
         games_total_today=games_total_today,
         unread_messages=unread_messages,
         total_users=total_users,
+        active_users_today=active_users_today,
     )
 
 class AdminReplyRequest(BaseModel):
@@ -305,3 +308,36 @@ async def mark_messages_read(
     result = await db.execute(stmt)
     await db.commit()
     return MarkReadResponse(success=True, marked_count=result.rowcount)
+
+
+from app.services.remote_config_service import remote_config_service
+
+class RemoteConfigRequest(BaseModel):
+    parameters: Dict[str, Any]
+    etag: str
+
+@firebase_router.get("/remote-config")
+async def get_remote_config(current_user: User = Depends(_require_admin)):
+    """Fetch Firebase remote config template."""
+    template, etag = await remote_config_service.get_template()
+    return {"parameters": template.get("parameters", {}), "etag": etag}
+
+@firebase_router.post("/remote-config")
+async def update_remote_config(
+    req: RemoteConfigRequest,
+    current_user: User = Depends(_require_admin)
+):
+    """Update Firebase remote config template."""
+    template, current_etag = await remote_config_service.get_template()
+    
+    template["parameters"] = req.parameters
+    
+    try:
+        updated_template = await remote_config_service.publish_template(template, req.etag)
+        return {"success": True, "parameters": updated_template.get("parameters", {})}
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Error updating remote config: {e.response.text}")
+        raise HTTPException(status_code=400, detail="Failed to update remote config. Ensure you are editing the latest version.")
+    except Exception as e:
+        logger.error(f"Error updating remote config: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")

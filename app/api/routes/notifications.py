@@ -15,7 +15,7 @@ from typing import Optional, List
 import logging
 
 from app.database import get_db_session, AsyncSessionLocal
-from app.api.dependencies import get_admin_api_key
+from app.api.dependencies import _require_admin
 from app.models.db_models import Notification, NotifStatusEnum
 from app.services import fcm_service
 
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(
     prefix="/api/admin/notifications",
     tags=["Admin Notifications"],
-    dependencies=[Depends(get_admin_api_key)],
+    dependencies=[Depends(_require_admin)],
 )
 
 

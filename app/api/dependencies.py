@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db_session
 from app.utils.firebase_auth import verify_firebase_token
 from app.services.user_service import user_service
-from app.models.db_models import User
+from app.models.db_models import User, UserRoleEnum
 import logging
 import os
 
@@ -57,3 +57,12 @@ async def get_current_db_user(
         
     logger.info(f"[DEBUG] User {firebase_uid} found in DB: user_idn={user.user_idn}")
     return user
+
+async def _require_admin(current_user: User = Depends(get_current_db_user)) -> User:
+    """Dependency that ensures the authenticated user has the 'admin' role."""
+    if current_user.role != UserRoleEnum.admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required",
+        )
+    return current_user
