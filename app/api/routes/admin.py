@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, and_, func, desc
 from pydantic import BaseModel
@@ -9,7 +9,7 @@ import httpx
 
 from app.database import get_db_session
 from app.api.dependencies import get_admin_api_key, get_current_db_user, _require_admin
-from app.models.db_models import User, Message, MessageTypeEnum, UserDevice, Game, GameResultEnum, UserRoleEnum
+from app.models.db_models import User, Message, MessageTypeEnum, UserDevice, Game, GamePlayer, GameResultEnum, GameTypeEnum, UserRoleEnum
 from app.services import fcm_service
 from app.services.redis_client import redis_client
 
@@ -24,10 +24,10 @@ firebase_router = APIRouter(prefix="/api/admin", tags=["Admin Dashboard"])
 
 class AdminStatsResponse(BaseModel):
     users_online: int
-    games_in_progress: int
-    games_completed: int
-    games_cancelled: int
-    games_total_today: int
+    games_online_today: int
+    games_offline_today: int
+    games_in_progress_online: int
+    games_in_progress_offline: int
     unread_messages: int
     total_users: int
     active_users_today: int
@@ -36,6 +36,7 @@ class AdminStatsResponse(BaseModel):
 @firebase_router.get("/dashboard/stats", response_model=AdminStatsResponse)
 async def get_dashboard_stats(
     admin_user_idn: int,
+    tz_offset: int = Query(0, description="Timezone offset in minutes"),
     current_user: User = Depends(_require_admin),
     db: AsyncSession = Depends(get_db_session),
 ):
@@ -59,52 +60,58 @@ async def get_dashboard_stats(
     )
     total_users = total_users_result.scalar() or 0
 
-    today = datetime.now(timezone.utc).date()
+    today = (datetime.now(timezone.utc) + timedelta(minutes=tz_offset)).date()
 
-    # Active users today
     active_users_today_result = await db.execute(
-        select(func.count()).where(
-            User.entity_active == True,
-            func.date(User.last_active_date) == today,
+        select(func.count(func.distinct(GamePlayer.user_idn))).join(
+            Game, GamePlayer.game_idn == Game.game_idn
+        ).where(
+            func.date(Game.crt_dt + timedelta(minutes=tz_offset)) == today,
+            GamePlayer.entity_active == True,
+            Game.entity_active == True
         )
     )
     active_users_today = active_users_today_result.scalar() or 0
 
-    # Games in progress
-    games_in_progress_result = await db.execute(
+    # Games In Progress Online
+    games_in_progress_online_result = await db.execute(
         select(func.count()).where(
             Game.result == GameResultEnum.in_progress,
+            Game.game_type == GameTypeEnum.online,
             Game.entity_active == True,
         )
     )
-    games_in_progress = games_in_progress_result.scalar() or 0
+    games_in_progress_online = games_in_progress_online_result.scalar() or 0
 
-    # Games completed
-    games_completed_result = await db.execute(
+    # Games In Progress Offline
+    games_in_progress_offline_result = await db.execute(
         select(func.count()).where(
-            Game.result == GameResultEnum.completed,
+            Game.result == GameResultEnum.in_progress,
+            Game.game_type == GameTypeEnum.offline,
             Game.entity_active == True,
         )
     )
-    games_completed = games_completed_result.scalar() or 0
+    games_in_progress_offline = games_in_progress_offline_result.scalar() or 0
 
-    # Games cancelled
-    games_cancelled_result = await db.execute(
-        select(func.count()).where(
-            Game.result == GameResultEnum.cancelled,
-            Game.entity_active == True,
-        )
-    )
-    games_cancelled = games_cancelled_result.scalar() or 0
-
-    # Games total today
-    games_today_result = await db.execute(
+    # Games Online Today
+    games_online_today_result = await db.execute(
         select(func.count()).where(
             Game.entity_active == True,
-            func.date(Game.crt_dt) == today,
+            Game.game_type == GameTypeEnum.online,
+            func.date(Game.crt_dt + timedelta(minutes=tz_offset)) == today,
         )
     )
-    games_total_today = games_today_result.scalar() or 0
+    games_online_today = games_online_today_result.scalar() or 0
+
+    # Games Offline Today
+    games_offline_today_result = await db.execute(
+        select(func.count()).where(
+            Game.entity_active == True,
+            Game.game_type == GameTypeEnum.offline,
+            func.date(Game.crt_dt + timedelta(minutes=tz_offset)) == today,
+        )
+    )
+    games_offline_today = games_offline_today_result.scalar() or 0
 
     # Unread messages for admin
     unread_result = await db.execute(
@@ -118,10 +125,10 @@ async def get_dashboard_stats(
 
     return AdminStatsResponse(
         users_online=users_online,
-        games_in_progress=games_in_progress,
-        games_completed=games_completed,
-        games_cancelled=games_cancelled,
-        games_total_today=games_total_today,
+        games_online_today=games_online_today,
+        games_offline_today=games_offline_today,
+        games_in_progress_online=games_in_progress_online,
+        games_in_progress_offline=games_in_progress_offline,
         unread_messages=unread_messages,
         total_users=total_users,
         active_users_today=active_users_today,
@@ -390,4 +397,153 @@ async def clear_redis_data(
         return {"status": "success", "message": "Redis database cleared."}
     except Exception as e:
         logger.error(f"Error clearing redis: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+class ActiveUserResponse(BaseModel):
+    user_idn: int
+    display_name: Optional[str] = None
+    email: Optional[str] = None
+    last_active_date: Optional[datetime] = None
+    online_games: int
+    offline_games: int
+    date_online_games: int
+    date_offline_games: int
+
+@firebase_router.get("/users/all", response_model=List[ActiveUserResponse])
+async def get_all_users(
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(_require_admin)
+):
+    try:
+        from sqlalchemy import func
+        from app.models.db_models import GamePlayer, Game, GameTypeEnum
+        
+        offset = (page - 1) * limit
+
+        subq_online = select(func.count(GamePlayer.game_idn)).join(
+            Game, GamePlayer.game_idn == Game.game_idn
+        ).where(
+            GamePlayer.user_idn == User.user_idn,
+            Game.game_type == GameTypeEnum.online,
+            GamePlayer.entity_active == True,
+            Game.entity_active == True
+        ).scalar_subquery()
+
+        subq_offline = select(func.count(GamePlayer.game_idn)).join(
+            Game, GamePlayer.game_idn == Game.game_idn
+        ).where(
+            GamePlayer.user_idn == User.user_idn,
+            Game.game_type == GameTypeEnum.offline,
+            GamePlayer.entity_active == True,
+            Game.entity_active == True
+        ).scalar_subquery()
+
+        query = select(
+            User,
+            subq_online.label("online_games"),
+            subq_offline.label("offline_games")
+        ).where(
+            User.entity_active == True
+        ).order_by(
+            User.crt_dt.desc()
+        ).offset(offset).limit(limit)
+
+        result = await db.execute(query)
+        rows = result.all()
+
+        response = []
+        for user_obj, online_count, offline_count in rows:
+            response.append({
+                "user_idn": user_obj.user_idn,
+                "display_name": user_obj.display_name,
+                "email": user_obj.email,
+                "last_active_date": user_obj.last_active_date,
+                "online_games": online_count or 0,
+                "offline_games": offline_count or 0,
+                "date_online_games": 0,
+                "date_offline_games": 0,
+            })
+            
+        return response
+    except Exception as e:
+        logger.error(f"Error fetching all users: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@firebase_router.get("/users/active-by-date", response_model=List[ActiveUserResponse])
+async def get_active_users_by_date(
+    date: str = Query(None, description="Date in YYYY-MM-DD format. Defaults to today."),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    tz_offset: int = Query(0, description="Timezone offset in minutes"),
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(_require_admin)
+):
+    try:
+        from datetime import datetime, timezone, timedelta
+        from sqlalchemy import func
+        from app.models.db_models import GamePlayer, Game, GameTypeEnum
+        
+        target_date = (datetime.now(timezone.utc) + timedelta(minutes=tz_offset)).date()
+        if date:
+            target_date = datetime.strptime(date, "%Y-%m-%d").date()
+
+        offset = (page - 1) * limit
+
+        subq_date_online = select(func.count(GamePlayer.game_idn)).join(
+            Game, GamePlayer.game_idn == Game.game_idn
+        ).where(
+            GamePlayer.user_idn == User.user_idn,
+            Game.game_type == GameTypeEnum.online,
+            func.date(Game.crt_dt + timedelta(minutes=tz_offset)) == target_date,
+            GamePlayer.entity_active == True,
+            Game.entity_active == True
+        ).scalar_subquery()
+
+        subq_date_offline = select(func.count(GamePlayer.game_idn)).join(
+            Game, GamePlayer.game_idn == Game.game_idn
+        ).where(
+            GamePlayer.user_idn == User.user_idn,
+            Game.game_type == GameTypeEnum.offline,
+            func.date(Game.crt_dt + timedelta(minutes=tz_offset)) == target_date,
+            GamePlayer.entity_active == True,
+            Game.entity_active == True
+        ).scalar_subquery()
+
+        query = select(
+            User,
+            subq_date_online.label("date_online_games"),
+            subq_date_offline.label("date_offline_games")
+        ).where(
+            User.entity_active == True,
+            User.user_idn.in_(
+                select(GamePlayer.user_idn).join(Game).where(
+                    func.date(Game.crt_dt + timedelta(minutes=tz_offset)) == target_date
+                )
+            )
+        ).order_by(
+            User.last_active_date.desc()
+        ).offset(offset).limit(limit)
+
+        result = await db.execute(query)
+        rows = result.all()
+
+        response = []
+        for user_obj, date_online_count, date_offline_count in rows:
+            response.append({
+                "user_idn": user_obj.user_idn,
+                "display_name": user_obj.display_name,
+                "email": user_obj.email,
+                "last_active_date": user_obj.last_active_date,
+                "online_games": 0,
+                "offline_games": 0,
+                "date_online_games": date_online_count or 0,
+                "date_offline_games": date_offline_count or 0,
+            })
+            
+        return response
+    except Exception as e:
+        logger.error(f"Error fetching active users by date: {e}")
         raise HTTPException(status_code=500, detail=str(e))
