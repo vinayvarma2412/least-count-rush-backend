@@ -9,7 +9,7 @@ import httpx
 
 from app.database import get_db_session
 from app.api.dependencies import get_admin_api_key, get_current_db_user, _require_admin
-from app.models.db_models import User, Message, MessageTypeEnum, UserDevice, Game, GamePlayer, GameResultEnum, GameTypeEnum, GameModeEnum, UserRoleEnum, LeaderboardSeason
+from app.models.db_models import User, Message, MessageTypeEnum, UserDevice, Game, GamePlayer, GameResultEnum, GameTypeEnum, GameModeEnum, UserRoleEnum, LeaderboardSeason, AdImpression, AdPlacementEnum
 from app.services import fcm_service
 from app.services.redis_client import redis_client
 
@@ -31,6 +31,9 @@ class AdminStatsResponse(BaseModel):
     unread_messages: int
     total_users: int
     active_users_today: int
+    ad_rewarded_today: int = 0
+    ad_interstitial_today: int = 0
+    ad_banner_today: int = 0
 
 
 @firebase_router.get("/dashboard/stats", response_model=AdminStatsResponse)
@@ -123,6 +126,28 @@ async def get_dashboard_stats(
     )
     unread_messages = unread_result.scalar() or 0
 
+    # Ad impressions today based on upd_dt
+    tomorrow_start = today_start + timedelta(days=1)
+    ad_impressions_result = await db.execute(
+        select(AdImpression.placement, func.sum(AdImpression.impression_count)).where(
+            AdImpression.upd_dt >= today_start,
+            AdImpression.upd_dt < tomorrow_start
+        ).group_by(AdImpression.placement)
+    )
+    
+    ad_impressions_rows = ad_impressions_result.all()
+    ad_rewarded_today = 0
+    ad_interstitial_today = 0
+    ad_banner_today = 0
+    
+    for placement, total_count in ad_impressions_rows:
+        if placement == AdPlacementEnum.rewarded:
+            ad_rewarded_today = total_count or 0
+        elif placement == AdPlacementEnum.interstitial:
+            ad_interstitial_today = total_count or 0
+        elif placement == AdPlacementEnum.banner:
+            ad_banner_today = total_count or 0
+
     return AdminStatsResponse(
         users_online=users_online,
         games_online_today=games_online_today,
@@ -132,6 +157,9 @@ async def get_dashboard_stats(
         unread_messages=unread_messages,
         total_users=total_users,
         active_users_today=active_users_today,
+        ad_rewarded_today=ad_rewarded_today,
+        ad_interstitial_today=ad_interstitial_today,
+        ad_banner_today=ad_banner_today,
     )
 
 class AdminReplyRequest(BaseModel):
@@ -706,6 +734,7 @@ class AdminGameResponse(BaseModel):
     crt_dt: datetime
     started_at: Optional[datetime]
     ended_at: Optional[datetime]
+    score_limit: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -751,7 +780,8 @@ async def get_admin_game_details(
         "crt_dt": game_obj.crt_dt,
         "started_at": game_obj.started_at,
         "ended_at": game_obj.ended_at,
-        "host_display_name": host_name
+        "host_display_name": host_name,
+        "score_limit": game_obj.score_limit
     }
     
     # 2. Fetch players
@@ -857,7 +887,8 @@ async def get_admin_games(
             "crt_dt": game_obj.crt_dt,
             "started_at": game_obj.started_at,
             "ended_at": game_obj.ended_at,
-            "host_display_name": host_name
+            "host_display_name": host_name,
+            "score_limit": game_obj.score_limit
         })
     
     return response
