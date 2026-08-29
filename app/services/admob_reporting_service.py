@@ -46,16 +46,28 @@ class AdMobReportingService:
         except Exception as e:
             logger.error(f"Failed to initialize AdMob service: {e}")
 
-    def _generate_report_sync(self, start_date: datetime, end_date: datetime) -> float:
+    def _generate_report_sync(self, start_date: datetime, end_date: datetime) -> dict:
         if not self.service or not settings.admob_publisher_id:
-            return 0.0
+            return {"total": 0.0, "ios": 0.0, "android": 0.0}
 
         report_spec = {
             "dateRange": {
                 "startDate": {"year": start_date.year, "month": start_date.month, "day": start_date.day},
                 "endDate": {"year": end_date.year, "month": end_date.month, "day": end_date.day}
             },
-            "metrics": ["ESTIMATED_EARNINGS"]
+            "dimensions": ["APP"],
+            "metrics": ["ESTIMATED_EARNINGS"],
+            "dimensionFilters": [
+                {
+                    "dimension": "APP",
+                    "matchesAny": {
+                        "values": [
+                            "ca-app-pub-9959591108553606~2734505358",  # LCR Android
+                            "ca-app-pub-9959591108553606~1010360141"   # LCR iOS
+                        ]
+                    }
+                }
+            ]
         }
 
         try:
@@ -67,37 +79,149 @@ class AdMobReportingService:
                 parent=parent,
                 body={"reportSpec": report_spec}
             )
-            response = request.execute()
+            import socket
+            import ssl
+            import time
             
-            # The response is a list of lines. 
-            # First line is usually headers, the rest are data, and the last line is a footer.
-            # Look for the footer row which contains the totals.
-            total_earnings = 0.0
+            old_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(120)
             
-            # Response is a list of dicts: [{'header': {...}}, {'row': {'metricValues': {'ESTIMATED_EARNINGS': {'microsValue': '...'}}}}, {'footer': {...}}]
-            # Or the footer has the totals. Let's just sum all rows or use the footer.
-            for item in response:
-                if 'footer' in item and 'metricValues' in item['footer']:
-                    earnings_micros = item['footer']['metricValues'].get('ESTIMATED_EARNINGS', {}).get('microsValue', '0')
-                    total_earnings = float(earnings_micros) / 1_000_000.0
-                    return total_earnings
+            response = None
+            for attempt in range(3):
+                try:
+                    response = request.execute(num_retries=3)
+                    break
+                except (socket.error, ssl.SSLError) as e:
+                    logger.warning(f"AdMob request attempt {attempt + 1} failed: {e}")
+                    if attempt == 2:
+                        raise
+                    time.sleep(2 ** attempt)  # Exponential backoff
+            
+            socket.setdefaulttimeout(old_timeout)
+            
+            result = {"total": 0.0, "ios": 0.0, "android": 0.0}
+            
+            if not response:
+                return result
                 
-            return total_earnings
+            for item in response:
+                if 'row' in item and 'metricValues' in item['row']:
+                    earnings_micros = item['row']['metricValues'].get('ESTIMATED_EARNINGS', {}).get('microsValue', '0')
+                    val = float(earnings_micros) / 1_000_000.0
+                    result["total"] += val
+                    
+                    app_id = item['row'].get('dimensionValues', {}).get('APP', {}).get('value', '')
+                    if app_id == "ca-app-pub-9959591108553606~2734505358":
+                        result["android"] += val
+                    elif app_id == "ca-app-pub-9959591108553606~1010360141":
+                        result["ios"] += val
+                
+            return result
         except Exception as e:
             logger.error(f"Error fetching AdMob report: {e}")
-            return 0.0
+            return {"total": 0.0, "ios": 0.0, "android": 0.0}
 
-    async def get_earnings_today(self, tz_offset_minutes: int = 0) -> float:
+    def _generate_detailed_report_sync(self, start_date: datetime, end_date: datetime, dimension: str) -> list:
+        if not self.service or not settings.admob_publisher_id:
+            return []
+
+        report_spec = {
+            "dateRange": {
+                "startDate": {"year": start_date.year, "month": start_date.month, "day": start_date.day},
+                "endDate": {"year": end_date.year, "month": end_date.month, "day": end_date.day}
+            },
+            "dimensions": [dimension],
+            "metrics": ["ESTIMATED_EARNINGS"],
+            "dimensionFilters": [
+                {
+                    "dimension": "APP",
+                    "matchesAny": {
+                        "values": [
+                            "ca-app-pub-9959591108553606~2734505358",
+                            "ca-app-pub-9959591108553606~1010360141"
+                        ]
+                    }
+                }
+            ]
+        }
+
+        try:
+            parent = f"accounts/{settings.admob_publisher_id}"
+            if not parent.startswith("accounts/pub-"):
+                parent = f"accounts/pub-{settings.admob_publisher_id.replace('pub-', '')}"
+
+            request = self.service.accounts().networkReport().generate(
+                parent=parent,
+                body={"reportSpec": report_spec}
+            )
+            import socket
+            import ssl
+            import time
+            
+            old_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(120)
+            
+            response = None
+            for attempt in range(3):
+                try:
+                    response = request.execute(num_retries=3)
+                    break
+                except (socket.error, ssl.SSLError) as e:
+                    logger.warning(f"AdMob request attempt {attempt + 1} failed: {e}")
+                    if attempt == 2:
+                        raise
+                    time.sleep(2 ** attempt)  # Exponential backoff
+            
+            socket.setdefaulttimeout(old_timeout)
+            
+            result = []
+            if not response:
+                return result
+                
+            for item in response:
+                if 'row' in item and 'metricValues' in item['row']:
+                    earnings_micros = item['row']['metricValues'].get('ESTIMATED_EARNINGS', {}).get('microsValue', '0')
+                    val = float(earnings_micros) / 1_000_000.0
+                    
+                    dim_val = item['row'].get('dimensionValues', {}).get(dimension, {})
+                    # For AD_UNIT, prefer displayLabel, fallback to value. For COUNTRY, use value.
+                    name = dim_val.get('displayLabel') or dim_val.get('value', 'Unknown')
+                    
+                    result.append({"name": name, "earnings": val})
+                    
+            # Sort descending by earnings
+            result.sort(key=lambda x: x["earnings"], reverse=True)
+            return result
+        except Exception as e:
+            logger.error(f"Error fetching detailed AdMob report for {dimension}: {e}")
+            return []
+
+    async def get_earnings_today(self, tz_offset_minutes: int = 0) -> dict:
         # Calculate today in the requested timezone
         from datetime import timedelta
         now_tz = datetime.now(timezone.utc) + timedelta(minutes=tz_offset_minutes)
         return await asyncio.to_thread(self._generate_report_sync, now_tz, now_tz)
 
-    async def get_earnings_this_month(self, tz_offset_minutes: int = 0) -> float:
+    async def get_earnings_this_month(self, tz_offset_minutes: int = 0) -> dict:
         from datetime import timedelta
         now_tz = datetime.now(timezone.utc) + timedelta(minutes=tz_offset_minutes)
         start_of_month = now_tz.replace(day=1)
         return await asyncio.to_thread(self._generate_report_sync, start_of_month, now_tz)
+
+    async def get_detailed_earnings_this_month(self, tz_offset_minutes: int = 0) -> dict:
+        from datetime import timedelta
+        now_tz = datetime.now(timezone.utc) + timedelta(minutes=tz_offset_minutes)
+        start_of_month = now_tz.replace(day=1)
+        
+        unit_wise, country_wise = await asyncio.gather(
+            asyncio.to_thread(self._generate_detailed_report_sync, start_of_month, now_tz, "AD_UNIT"),
+            asyncio.to_thread(self._generate_detailed_report_sync, start_of_month, now_tz, "COUNTRY")
+        )
+        
+        return {
+            "unit_wise": unit_wise,
+            "country_wise": country_wise
+        }
 
 
 admob_reporting_service = AdMobReportingService()
