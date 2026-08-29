@@ -8,3 +8,5 @@ sqlalchemy[asyncio]>=2.0.0
 alembic>=1.13.0
 firebase-admin>=6.5.0
 redis>=5.0.0
+google-api-python-client>=2.0.0
+google-auth-oauthlib>=1.2.0
