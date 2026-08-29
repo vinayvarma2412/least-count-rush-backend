@@ -12,6 +12,7 @@ from app.api.dependencies import get_admin_api_key, get_current_db_user, _requir
 from app.models.db_models import User, Message, MessageTypeEnum, UserDevice, Game, GamePlayer, GameResultEnum, GameTypeEnum, GameModeEnum, UserRoleEnum, LeaderboardSeason, AdImpression, AdPlacementEnum
 from app.services import fcm_service
 from app.services.redis_client import redis_client
+from app.services.admob_reporting_service import admob_reporting_service
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,8 @@ class AdminStatsResponse(BaseModel):
     ad_rewarded_today: int = 0
     ad_interstitial_today: int = 0
     ad_banner_today: int = 0
+    estimated_earnings_today: float = 0.0
+    estimated_earnings_month: float = 0.0
 
 
 @firebase_router.get("/dashboard/stats", response_model=AdminStatsResponse)
@@ -148,6 +151,17 @@ async def get_dashboard_stats(
         elif placement == AdPlacementEnum.banner:
             ad_banner_today = total_count or 0
 
+    # Fetch AdMob Earnings
+    try:
+        import asyncio
+        earnings_today, earnings_month = await asyncio.gather(
+            admob_reporting_service.get_earnings_today(tz_offset),
+            admob_reporting_service.get_earnings_this_month(tz_offset)
+        )
+    except Exception as e:
+        logger.error(f"Failed to fetch admob earnings: {e}")
+        earnings_today, earnings_month = 0.0, 0.0
+
     return AdminStatsResponse(
         users_online=users_online,
         games_online_today=games_online_today,
@@ -160,6 +174,8 @@ async def get_dashboard_stats(
         ad_rewarded_today=ad_rewarded_today,
         ad_interstitial_today=ad_interstitial_today,
         ad_banner_today=ad_banner_today,
+        estimated_earnings_today=earnings_today,
+        estimated_earnings_month=earnings_month,
     )
 
 class AdminReplyRequest(BaseModel):
