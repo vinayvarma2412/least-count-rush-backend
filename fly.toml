@@ -1,22 +1,24 @@
-# fly.toml app configuration file generated for leastcountrush on 2026-08-09T18:36:49Z
+# fly.toml app configuration file generated for least-count-rush-backend on 2026-08-29T07:00:24Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = "leastcountrush"
-primary_region = "bom"
+app = 'least-count-rush-backend'
+primary_region = 'sin'
+
+[build]
 
 [http_service]
-auto_start_machines = true
-auto_stop_machines = true
-force_https = true
-internal_port = 8080
-min_machines_running = 1
-processes = ['app']
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ['app']
 
 [[vm]]
+  size = 'shared-cpu-1x'
   cpu_kind = 'shared'
   cpus = 1
   memory_mb = 512
   processes = ['app']
-  size = 'shared-cpu-1x'
