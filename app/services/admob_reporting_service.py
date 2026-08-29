@@ -91,7 +91,7 @@ class AdMobReportingService:
                 try:
                     response = request.execute(num_retries=3)
                     break
-                except (socket.error, ssl.SSLError) as e:
+                except Exception as e:
                     logger.warning(f"AdMob request attempt {attempt + 1} failed: {e}")
                     if attempt == 2:
                         raise
@@ -166,7 +166,7 @@ class AdMobReportingService:
                 try:
                     response = request.execute(num_retries=3)
                     break
-                except (socket.error, ssl.SSLError) as e:
+                except Exception as e:
                     logger.warning(f"AdMob request attempt {attempt + 1} failed: {e}")
                     if attempt == 2:
                         raise
