@@ -4,7 +4,7 @@
 #
 
 app = "leastcountrush"
-primary_region = "bom"
+primary_region = "sin"
 
 [http_service]
 auto_start_machines = true
