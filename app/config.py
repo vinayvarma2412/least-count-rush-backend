@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     port: int = int(os.getenv("PORT", 8000))
     database_url: str = ""
     firebase_project_id: str = ""
+    admob_publisher_id: str = ""
+    admob_client_id: str = ""
+    admob_client_secret: str = ""
+    admob_refresh_token: str = ""
     
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

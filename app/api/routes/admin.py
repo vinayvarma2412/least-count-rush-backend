@@ -12,6 +12,7 @@ from app.api.dependencies import get_admin_api_key, get_current_db_user, _requir
 from app.models.db_models import User, Message, MessageTypeEnum, UserDevice, Game, GamePlayer, GameResultEnum, GameTypeEnum, GameModeEnum, UserRoleEnum, LeaderboardSeason, AdImpression, AdPlacementEnum
 from app.services import fcm_service
 from app.services.redis_client import redis_client
+from app.services.admob_reporting_service import admob_reporting_service
 
 logger = logging.getLogger(__name__)
 
@@ -22,52 +23,56 @@ router = APIRouter(prefix="/api/admin", tags=["Admin"], dependencies=[Depends(ge
 firebase_router = APIRouter(prefix="/api/admin", tags=["Admin Dashboard"])
 
 
-class AdminStatsResponse(BaseModel):
+class AdminStatsUsersResponse(BaseModel):
     users_online: int
+    total_users: int
+    active_users_today: int
+
+class AdminStatsGamesResponse(BaseModel):
     games_online_today: int
     games_offline_today: int
     games_in_progress_online: int
     games_in_progress_offline: int
+
+class AdminStatsMessagesResponse(BaseModel):
     unread_messages: int
-    total_users: int
-    active_users_today: int
+
+class AdminStatsAdsResponse(BaseModel):
     ad_rewarded_today: int = 0
     ad_interstitial_today: int = 0
     ad_banner_today: int = 0
 
+class AppEarnings(BaseModel):
+    total: float = 0.0
+    ios: float = 0.0
+    android: float = 0.0
 
-@firebase_router.get("/dashboard/stats", response_model=AdminStatsResponse)
-async def get_dashboard_stats(
-    admin_user_idn: int,
+class AdminStatsEarningsResponse(BaseModel):
+    estimated_earnings_today: AppEarnings = AppEarnings()
+    estimated_earnings_month: AppEarnings = AppEarnings()
+
+@firebase_router.get("/dashboard/stats/users", response_model=AdminStatsUsersResponse)
+async def get_dashboard_stats_users(
     tz_offset: int = Query(0, description="Timezone offset in minutes"),
     current_user: User = Depends(_require_admin),
     db: AsyncSession = Depends(get_db_session),
 ):
-    """
-    Aggregate dashboard statistics for the admin app.
-    Protected by Firebase authentication + admin role check.
-    admin_user_idn is the DB idn of the admin, used to count unread messages.
-    """
-    from datetime import date, timedelta
-    from sqlalchemy import cast, Date as SADate
-
-    # Users online
+    from datetime import datetime, timezone, timedelta
+    
     users_online_result = await db.execute(
         select(func.count()).where(User.is_online == True, User.entity_active == True)
     )
     users_online = users_online_result.scalar() or 0
 
-    # Total users
     total_users_result = await db.execute(
         select(func.count()).where(User.entity_active == True)
     )
     total_users = total_users_result.scalar() or 0
 
-    today = (datetime.now(timezone.utc) + timedelta(minutes=tz_offset)).date()
-    # Active today means last_active_date is today in user's timezone
     user_now = datetime.now(timezone.utc) + timedelta(minutes=tz_offset)
     user_today_start = user_now.replace(hour=0, minute=0, second=0, microsecond=0)
     today_start = user_today_start - timedelta(minutes=tz_offset)
+    
     active_users_today_result = await db.execute(
         select(func.count()).where(
             User.last_active_date >= today_start,
@@ -76,7 +81,21 @@ async def get_dashboard_stats(
     )
     active_users_today = active_users_today_result.scalar() or 0
 
-    # Games In Progress Online
+    return AdminStatsUsersResponse(
+        users_online=users_online,
+        total_users=total_users,
+        active_users_today=active_users_today,
+    )
+
+
+@firebase_router.get("/dashboard/stats/games", response_model=AdminStatsGamesResponse)
+async def get_dashboard_stats_games(
+    tz_offset: int = Query(0, description="Timezone offset in minutes"),
+    current_user: User = Depends(_require_admin),
+    db: AsyncSession = Depends(get_db_session),
+):
+    from datetime import datetime, timezone, timedelta
+    
     games_in_progress_online_result = await db.execute(
         select(func.count()).where(
             Game.result == GameResultEnum.in_progress,
@@ -86,7 +105,6 @@ async def get_dashboard_stats(
     )
     games_in_progress_online = games_in_progress_online_result.scalar() or 0
 
-    # Games In Progress Offline
     games_in_progress_offline_result = await db.execute(
         select(func.count()).where(
             Game.result == GameResultEnum.in_progress,
@@ -96,7 +114,8 @@ async def get_dashboard_stats(
     )
     games_in_progress_offline = games_in_progress_offline_result.scalar() or 0
 
-    # Games Online Today
+    today = (datetime.now(timezone.utc) + timedelta(minutes=tz_offset)).date()
+    
     games_online_today_result = await db.execute(
         select(func.count()).where(
             Game.entity_active == True,
@@ -106,7 +125,6 @@ async def get_dashboard_stats(
     )
     games_online_today = games_online_today_result.scalar() or 0
 
-    # Games Offline Today
     games_offline_today_result = await db.execute(
         select(func.count()).where(
             Game.entity_active == True,
@@ -116,7 +134,20 @@ async def get_dashboard_stats(
     )
     games_offline_today = games_offline_today_result.scalar() or 0
 
-    # Unread messages for admin
+    return AdminStatsGamesResponse(
+        games_online_today=games_online_today,
+        games_offline_today=games_offline_today,
+        games_in_progress_online=games_in_progress_online,
+        games_in_progress_offline=games_in_progress_offline,
+    )
+
+
+@firebase_router.get("/dashboard/stats/messages", response_model=AdminStatsMessagesResponse)
+async def get_dashboard_stats_messages(
+    admin_user_idn: int,
+    current_user: User = Depends(_require_admin),
+    db: AsyncSession = Depends(get_db_session),
+):
     unread_result = await db.execute(
         select(func.count()).where(
             Message.to_user_idn == admin_user_idn,
@@ -125,9 +156,22 @@ async def get_dashboard_stats(
         )
     )
     unread_messages = unread_result.scalar() or 0
+    return AdminStatsMessagesResponse(unread_messages=unread_messages)
 
-    # Ad impressions today based on upd_dt
+
+@firebase_router.get("/dashboard/stats/ads", response_model=AdminStatsAdsResponse)
+async def get_dashboard_stats_ads(
+    tz_offset: int = Query(0, description="Timezone offset in minutes"),
+    current_user: User = Depends(_require_admin),
+    db: AsyncSession = Depends(get_db_session),
+):
+    from datetime import datetime, timezone, timedelta
+    
+    user_now = datetime.now(timezone.utc) + timedelta(minutes=tz_offset)
+    user_today_start = user_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start = user_today_start - timedelta(minutes=tz_offset)
     tomorrow_start = today_start + timedelta(days=1)
+    
     ad_impressions_result = await db.execute(
         select(AdImpression.placement, func.sum(AdImpression.impression_count)).where(
             AdImpression.upd_dt >= today_start,
@@ -148,19 +192,55 @@ async def get_dashboard_stats(
         elif placement == AdPlacementEnum.banner:
             ad_banner_today = total_count or 0
 
-    return AdminStatsResponse(
-        users_online=users_online,
-        games_online_today=games_online_today,
-        games_offline_today=games_offline_today,
-        games_in_progress_online=games_in_progress_online,
-        games_in_progress_offline=games_in_progress_offline,
-        unread_messages=unread_messages,
-        total_users=total_users,
-        active_users_today=active_users_today,
+    return AdminStatsAdsResponse(
         ad_rewarded_today=ad_rewarded_today,
         ad_interstitial_today=ad_interstitial_today,
         ad_banner_today=ad_banner_today,
     )
+
+
+@firebase_router.get("/dashboard/stats/earnings", response_model=AdminStatsEarningsResponse)
+async def get_dashboard_stats_earnings(
+    tz_offset: int = Query(0, description="Timezone offset in minutes"),
+    current_user: User = Depends(_require_admin),
+):
+    try:
+        import asyncio
+        earnings_today, earnings_month = await asyncio.gather(
+            admob_reporting_service.get_earnings_today(tz_offset),
+            admob_reporting_service.get_earnings_this_month(tz_offset)
+        )
+    except Exception as e:
+        logger.error(f"Failed to fetch admob earnings: {e}")
+        earnings_today, earnings_month = {"total": 0.0, "ios": 0.0, "android": 0.0}, {"total": 0.0, "ios": 0.0, "android": 0.0}
+
+    return AdminStatsEarningsResponse(
+        estimated_earnings_today=AppEarnings(**earnings_today),
+        estimated_earnings_month=AppEarnings(**earnings_month),
+    )
+
+class EarningItem(BaseModel):
+    name: str
+    earnings: float
+
+class AdminStatsDetailedEarningsResponse(BaseModel):
+    unit_wise: List[EarningItem] = []
+    country_wise: List[EarningItem] = []
+
+@firebase_router.get("/dashboard/stats/earnings/detailed", response_model=AdminStatsDetailedEarningsResponse)
+async def get_dashboard_stats_earnings_detailed(
+    tz_offset: int = Query(0, description="Timezone offset in minutes"),
+    current_user: User = Depends(_require_admin),
+):
+    try:
+        detailed_data = await admob_reporting_service.get_detailed_earnings_this_month(tz_offset)
+        return AdminStatsDetailedEarningsResponse(
+            unit_wise=[EarningItem(**item) for item in detailed_data.get("unit_wise", [])],
+            country_wise=[EarningItem(**item) for item in detailed_data.get("country_wise", [])]
+        )
+    except Exception as e:
+        logger.error(f"Failed to fetch detailed admob earnings: {e}")
+        return AdminStatsDetailedEarningsResponse()
 
 class AdminReplyRequest(BaseModel):
     admin_user_idn: int
