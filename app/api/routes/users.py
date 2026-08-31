@@ -35,6 +35,10 @@ async def sync_user(
     firebase_uid = firebase_user.get("uid")
     email = firebase_user.get("email")
     display_name = firebase_user.get("name")
+    if display_name and len(display_name) > 15:
+        if " " in display_name:
+            display_name = display_name.split(" ")[0]
+        display_name = display_name[:15]
     
     logger.info(f"[DEBUG] sync_user called: firebase_uid={firebase_uid}, email={email}, display_name={display_name}, user_type={user_type}")
 
@@ -102,7 +106,7 @@ async def update_my_profile(
     updated_user = await user_service.update_user_profile(
         db=db,
         user_idn=user.user_idn,
-        display_name=req.display_name,
+        display_name=req.display_name[:15] if req.display_name else None,
         avatar_seed=req.avatar_seed
     )
     return {"status": "success", "display_name": updated_user.display_name}
