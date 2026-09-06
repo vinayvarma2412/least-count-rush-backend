@@ -432,19 +432,26 @@ async def process_and_broadcast_show_results(room_id: str, showed_by_id: str, re
 
                 async def delayed_start_next_round(r_id, elim_indices, turn_override, g_service, r_service):
                     import asyncio
+                    from app.utils.lock import get_room_lock
                     log.info("tournament_next_round_waiting_12s")
                     await asyncio.sleep(12)
-                    try:
-                        await g_service.clear_game(r_id)
-                        await r_service.update_room_status(r_id, RoomStatusEnum.WAITING)
-                        from app.api.websocket.game_ws import start_game_for_room
-                        started = await start_game_for_room(r_id, eliminated_indices=elim_indices, initial_turn_override=turn_override)
-                        log.info("tournament_next_round_started", {
-                            "started": started,
-                            "next_starter_index": turn_override,
-                        })
-                    except Exception as e:
-                        log.error("error_in_delayed_start_next_round", {"error": str(e)})
+                    for attempt in range(3):
+                        try:
+                            async with get_room_lock(r_id):
+                                await g_service.clear_game(r_id)
+                                await r_service.update_room_status(r_id, RoomStatusEnum.WAITING)
+                                from app.api.websocket.game_ws import start_game_for_room
+                                started = await start_game_for_room(r_id, eliminated_indices=elim_indices, initial_turn_override=turn_override)
+                                log.info("tournament_next_round_started", {
+                                    "started": started,
+                                    "next_starter_index": turn_override,
+                                    "attempt": attempt + 1,
+                                })
+                                break
+                        except Exception as e:
+                            log.error("error_in_delayed_start_next_round", {"error": str(e), "attempt": attempt + 1})
+                            if attempt < 2:
+                                await asyncio.sleep(2)
 
                 import asyncio
                 asyncio.create_task(delayed_start_next_round(room_id, eliminated_indices, next_starter, game_service, room_service))

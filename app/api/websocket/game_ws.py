@@ -50,9 +50,15 @@ async def start_game_for_room(room_id: str, eliminated_indices: list[int] | None
         if not getattr(p, "is_exited", False) and idx not in elim_set:
             active_players.append(p)
 
-    all_ready = all(player.is_ready for player in active_players)
+    is_public = room.room_type.value == "public"
+    if is_public:
+        check_players = [p for p in active_players if p.is_connected]
+    else:
+        check_players = active_players
+
+    all_ready = all(player.is_ready for player in check_players)
     if not all_ready:
-        not_ready = [p.player_name for p in active_players if not p.is_ready]
+        not_ready = [p.player_name for p in check_players if not p.is_ready]
         log.warn("start_game_failed", {
             "reason": "players_not_ready",
             "not_ready_players": not_ready,
@@ -161,6 +167,7 @@ async def start_game_for_room(room_id: str, eliminated_indices: list[int] | None
                     total_players=len(updated_room.players),
                     score_limit=score_limit,
                     created_user_idn=creator_idn,
+                    room_type=updated_room.room_type.value if getattr(updated_room, "room_type", None) else "public",
                     player_user_idns=player_user_idns,
                 )
 

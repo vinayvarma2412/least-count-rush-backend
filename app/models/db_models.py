@@ -186,6 +186,7 @@ class Game(Base):
     duration_seconds = Column(Integer, nullable=True)
     entity_active = Column(Boolean, default=True)
     client_game_id = Column(String(100), nullable=True)
+    room_type = Column(String(50), nullable=True)
     crt_dt = Column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
