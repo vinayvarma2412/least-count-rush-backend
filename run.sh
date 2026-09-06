@@ -143,4 +143,5 @@ fi
 
 # Run the FastAPI server
 LOG_LEVEL_LOWER=$(echo "${LOG_LEVEL:-info}" | tr '[:upper:]' '[:lower:]')
-"$UVICORN_CMD" app.main:app --reload --host 0.0.0.0 --port 8000 --log-level "$LOG_LEVEL_LOWER"
+PORT=${PORT:-8000}
+"$UVICORN_CMD" app.main:app --reload --host 0.0.0.0 --port "$PORT" --log-level "$LOG_LEVEL_LOWER"

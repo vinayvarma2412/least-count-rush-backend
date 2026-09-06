@@ -14,6 +14,12 @@ class RoomStatus(str, Enum):
     FINISHED = "finished"
 
 
+class RoomType(str, Enum):
+    """Room type enumeration"""
+    PRIVATE = "private"
+    PUBLIC = "public"
+
+
 class RoomCreate(BaseModel):
     """Schema for creating a room"""
     max_players: int = Field(default=6, ge=2, le=6, description="Maximum number of players")
@@ -34,6 +40,10 @@ class RoomCreate(BaseModel):
     creator_build_number: Optional[str] = Field(
         default=None,
         description="Build number of the room creator (e.g. '22')",
+    )
+    room_type: RoomType = Field(
+        default=RoomType.PRIVATE,
+        description='Room visibility: "private" (friends only) or "public" (matchmaking)',
     )
 
 
@@ -92,6 +102,10 @@ class RoomResponse(BaseModel):
         default=None,
         description="Region of the server where this room is hosted (e.g. 'bom', 'lax')"
     )
+    room_type: RoomType = Field(
+        default=RoomType.PRIVATE,
+        description='Room visibility: "private" (friends only) or "public" (matchmaking)',
+    )
     status: RoomStatus
     created_at: datetime
 
@@ -104,3 +118,7 @@ class RoomListResponse(BaseModel):
     rooms: List[RoomResponse]
     total: int
 
+
+class PublicRoomStatsResponse(BaseModel):
+    """Schema for public room stats"""
+    online_players: int

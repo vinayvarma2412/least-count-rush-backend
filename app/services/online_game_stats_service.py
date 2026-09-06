@@ -43,6 +43,7 @@ class OnlineGameStatsService:
         total_players: int,
         score_limit: Optional[int],
         created_user_idn: Optional[int],
+        room_type: Optional[str],
         player_user_idns: list[tuple[int, int]],  # [(user_idn, seat_no), ...]
     ) -> Optional[int]:
         """
@@ -70,6 +71,7 @@ class OnlineGameStatsService:
                 started_at=datetime.now(timezone.utc),
                 ended_at=None,
                 duration_seconds=None,
+                room_type=room_type,
             )
             db.add(game)
             await db.flush()  # populate game.game_idn before inserting players

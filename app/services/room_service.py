@@ -5,6 +5,7 @@ Key schema:
   room:{room_id}          → JSON blob of the room dict (TTL 4 h)
   room_code:{room_code}   → room_id string             (TTL 4 h)
   rooms:index             → Redis Set of all room_ids  (no TTL; cleaned lazily)
+  rooms:public_index      → Redis Set of public room_ids waiting for players
 """
 import os
 import uuid
@@ -12,7 +13,7 @@ import json
 import random
 from datetime import datetime, timezone
 from typing import Dict, Optional, List
-from app.schemas.room import RoomCreate, RoomResponse, RoomStatus, PlayerInfo
+from app.schemas.room import RoomCreate, RoomResponse, RoomStatus, RoomType, PlayerInfo
 from app.utils.room_logger import get_room_logger, close_room_logger, global_log
 from app.services.redis_client import redis_client, KEY_TTL_SECONDS
 
@@ -24,7 +25,7 @@ def _room_to_json(room: dict) -> str:
     def default(obj):
         if isinstance(obj, datetime):
             return obj.isoformat()
-        if isinstance(obj, RoomStatus):
+        if isinstance(obj, (RoomStatus, RoomType)):
             return obj.value
         raise TypeError(f"Object of type {type(obj)} is not JSON serialisable")
     return json.dumps(room, default=default)
@@ -67,11 +68,14 @@ class RoomService:
         """Persist room dict to Redis and refresh TTL."""
         room_id = room["room_id"]
         room_code = room.get("room_code", "")
+        is_public = room.get("room_type") in (RoomType.PUBLIC, RoomType.PUBLIC.value, "public")
         pipe = redis_client.pipeline()
         pipe.setex(self._room_key(room_id), KEY_TTL_SECONDS, _room_to_json(room))
         if room_code:
             pipe.setex(self._code_key(room_code), KEY_TTL_SECONDS, room_id)
         pipe.sadd("rooms:index", room_id)
+        if is_public:
+            pipe.sadd("rooms:public_index", room_id)
         await pipe.execute()
 
     async def _load_room(self, room_id: str) -> Optional[dict]:
@@ -116,6 +120,7 @@ class RoomService:
             "creator_build_number": room_data.creator_build_number,
             "server_url": os.getenv("PUBLIC_SERVER_URL"),
             "server_region": os.getenv("FLY_REGION"),
+            "room_type": room_data.room_type,
             "status": RoomStatus.WAITING,
             "created_at": datetime.now(timezone.utc),
         }
@@ -205,7 +210,9 @@ class RoomService:
             return False
 
         if len(room["players"]) == 0 and len(room.get("waiting_players", [])) == 0:
-            is_admin = True
+            is_public = room.get("room_type") in (RoomType.PUBLIC, RoomType.PUBLIC.value, "public")
+            if not is_public:
+                is_admin = True
 
         player = {
             "player_id": player_id,
@@ -301,6 +308,42 @@ class RoomService:
         await self._save_room(room)
         return True
 
+    async def force_remove_player(self, room_id: str, target_player_id: str) -> bool:
+        """Remove a player from a room without admin check."""
+        room = await self._load_room(room_id)
+        if not room:
+            return False
+
+        log = get_room_logger(room_id)
+        target_player = next((p for p in room["players"] + room.get("waiting_players", []) if p["player_id"] == target_player_id), None)
+        if not target_player:
+            return False
+
+        is_playing = room.get("status") in ("playing", "finished")
+        
+        if is_playing:
+            for p in room["players"]:
+                if p["player_id"] == target_player_id:
+                    p["is_exited"] = True
+                    p["exited_at"] = datetime.now(timezone.utc).isoformat()
+            room["waiting_players"] = [p for p in room.get("waiting_players", []) if p["player_id"] != target_player_id]
+        else:
+            room["players"] = [p for p in room["players"] if p["player_id"] != target_player_id]
+            room["waiting_players"] = [p for p in room.get("waiting_players", []) if p["player_id"] != target_player_id]
+
+        if len([p for p in room["players"] if not p.get("is_exited")]) == 0:
+            await self.delete_room(room_id)
+            return True
+
+        log.info("player_force_removed", {
+            "target_player_id": target_player_id,
+            "target_player_name": target_player.get("player_name"),
+            "remaining_players": len(room["players"]),
+        })
+
+        await self._save_room(room)
+        return True
+
     async def transfer_admin(self, room_id: str, old_admin_id: Optional[str] = None) -> Optional[str]:
         """Transfer admin to the next active player when admin leaves."""
         room = await self._load_room(room_id)
@@ -308,6 +351,10 @@ class RoomService:
             return None
 
         log = get_room_logger(room_id)
+        
+        is_public = room.get("room_type") in (RoomType.PUBLIC, RoomType.PUBLIC.value, "public")
+        if is_public:
+            return None
 
         for player in room["players"]:
             player["is_admin"] = False
@@ -558,9 +605,42 @@ class RoomService:
         if room_code:
             pipe.delete(self._code_key(room_code))
         pipe.srem("rooms:index", room_id)
+        pipe.srem("rooms:public_index", room_id)  # safe no-op for private rooms
         await pipe.execute()
 
         return True
+
+    async def find_open_public_room(self) -> Optional[str]:
+        """Find the first open public room that is WAITING and not full.
+
+        Returns the room_id of an eligible room, or None if no such room exists.
+        Stale entries in rooms:public_index are cleaned up lazily.
+        """
+        room_ids = await redis_client.smembers("rooms:public_index")
+        for room_id in room_ids:
+            room = await self._load_room(room_id)
+            if room is None:
+                # TTL expired — clean up lazily
+                await redis_client.srem("rooms:public_index", room_id)
+                await redis_client.srem("rooms:index", room_id)
+                continue
+
+            status = room.get("status")
+            is_waiting = status in (RoomStatus.WAITING, RoomStatus.WAITING.value, "waiting")
+            if not is_waiting:
+                # Room already started or finished — remove from public index
+                await redis_client.srem("rooms:public_index", room_id)
+                continue
+
+            total_players = len(room.get("players", [])) + len(room.get("waiting_players", []))
+            if total_players >= room.get("max_players", 6):
+                # Room is full — remove from public index so future searches skip it
+                await redis_client.srem("rooms:public_index", room_id)
+                continue
+
+            return room_id
+
+        return None
 
     async def merge_waiting_players(self, room_id: str) -> bool:
         """Merge waiting_players into main players list."""
@@ -632,6 +712,24 @@ class RoomService:
             global_log.info("old_rooms_cleaned", {"deleted_count": deleted_count, "max_age_hours": max_age_hours})
 
         return deleted_count
+
+    async def get_public_online_players_count(self) -> int:
+        """Get the total count of players currently in all public rooms (waiting or playing)."""
+        room_ids = await redis_client.smembers("rooms:public_index")
+        if not room_ids:
+            return 0
+
+        # MGET to fetch all rooms efficiently
+        keys = [self._room_key(rid) for rid in room_ids]
+        raw_rooms = await redis_client.mget(keys)
+
+        total_players = 0
+        for raw in raw_rooms:
+            if raw:
+                room = _room_from_json(raw)
+                total_players += len(room.get("players", [])) + len(room.get("waiting_players", []))
+        
+        return total_players
 
 
 # Global instance
