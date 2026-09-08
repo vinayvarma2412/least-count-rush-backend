@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     """Application settings"""
     app_name: str = "Least Count Rush Backend"
     debug: bool = False
+    develop_mode: bool = False
     host: str = "0.0.0.0"
     # Cloud Run uses PORT environment variable, default to 8080 for Cloud Run, 8000 for local
     port: int = int(os.getenv("PORT", 8000))

@@ -35,11 +35,32 @@ _SERVER_SELECTION_REPORT_TIMEOUT_SECONDS = 10
 
 
 async def _server_selection_urls() -> list[str]:
-    """Return the canonical server list. Unconditionally hardcoded for testing."""
-    return [
-        "https://least-count-rush-lax.fly.dev",
-        "https://least-count-rush-backend.fly.dev",
-    ]
+    """Return the canonical server list configured by the backend from Firebase config.
+    """
+    try:
+        from app.services.remote_config_service import remote_config_service
+        from app.config import settings
+        
+        template, _ = await remote_config_service.get_template()
+        key = "servers_list_dev" if settings.develop_mode else "servers_list"
+        configured = template.get("parameters", {}).get(key, {}).get("defaultValue", {}).get("value", "")
+        
+        if configured:
+            import json
+            values = json.loads(configured)
+            urls: list[str] = []
+            for value in values:
+                if isinstance(value, dict) and "url" in value:
+                    url = value["url"].strip().rstrip("/")
+                    if url.startswith(("http://", "https://")) and url not in urls:
+                        urls.append(url)
+            if urls:
+                return urls
+    except Exception as e:
+        from app.utils.room_logger import global_log
+        global_log.error("server_selection_urls_fetch_failed", {"error": str(e)})
+        
+    return []
 
 
 def _server_selection_key(room_id: str) -> str:
@@ -599,6 +620,12 @@ async def handle_join_room(websocket: WebSocket, room_id: str, data: Dict):
                     "player_id": player_id,
                     "player_name": player_name,
                 })
+
+        if room.status == RoomStatus.WAITING and len(room.players) >= 2:
+            if room_id not in _server_selection_tasks or _server_selection_tasks[room_id].done():
+                _server_selection_tasks[room_id] = asyncio.create_task(
+                    _start_server_selection(room_id, room)
+                )
     else:
         await manager.send_personal_message({
             "type": "error",
@@ -691,8 +718,6 @@ async def handle_player_ready(websocket: WebSocket, room_id: str, data: Dict):
         is_public = room.room_type.value == "public"
         
         # Debug printing
-        print(f"DEBUG: handle_player_ready - room_id={room_id}, player_id={player_id}, is_ready={is_ready}")
-        print(f"DEBUG: room.status={room.status}, len(room.players)={len(room.players)}")
 
         if is_public:
             active_players = [p for p in room.players if p.is_connected]
@@ -724,9 +749,8 @@ async def handle_player_ready(websocket: WebSocket, room_id: str, data: Dict):
             else:
                 all_in_game = all((player.is_in_game or not player.is_connected) for player in room.players)
 
-            print(f"DEBUG: all_ready={all_ready}, all_in_game={all_in_game}")
 
-            if all_ready:
+            if all_ready and all_in_game:
                 if is_public:
                     # Proceed straight to game if public, since public rooms might not need the server switch again
                     # Actually, we should find best server for public games too.
@@ -1090,7 +1114,6 @@ async def _start_server_selection(room_id: str, room):
         if not is_public or p.is_connected
     ]
     if len(expected_players) < 2:
-        print(f"DEBUG: expected_players < 2 ({len(expected_players)}). Aborting server selection.")
         return
     
     # Reset the accumulator *before* notifying clients.  A client can reply as
@@ -1226,9 +1249,8 @@ async def handle_server_switch_ack(websocket: WebSocket, room_id: str, data: Dic
         })
 
         if state["started"]:
-            log.info("server_switch_all_acknowledged_starting_game")
-            game_started = await game_ws.start_game_for_room(room_id)
-            if not game_started:
-                state["started"] = False
-                await redis_client.set(key, json.dumps(state), ex=KEY_TTL_SECONDS)
-                log.error("auto_game_start_failed_after_server_switch")
+            log.info("server_switch_all_acknowledged_waiting_for_frontend_countdown")
+            # We explicitly do NOT call start_game_for_room here.
+            # The frontend's 5-second countdown is still running. When it finishes,
+            # the frontend will navigate to the game screen and send set_in_game=True.
+            # handle_set_in_game will then call start_game_for_room.
