@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from fastapi import WebSocket, WebSocketDisconnect, HTTPException
 from typing import Dict
 import asyncio
+import json
+import os
 from app.api.websocket.connection_manager import manager
 from app.utils.lock import with_room_lock, get_room_lock
 from app.services.room_service import room_service
@@ -14,6 +16,7 @@ from app.api.websocket import game_ws
 from app.utils.room_logger import get_room_logger, global_log
 from app.utils.firebase_auth import verify_firebase_token
 from app.utils.debug_log import log_to_file
+from app.services.redis_client import KEY_TTL_SECONDS, redis_client
 
 # Track running connection status check tasks per room
 _connection_status_tasks: Dict[str, asyncio.Task] = {}
@@ -27,6 +30,42 @@ _heartbeat_watchdogs: Dict[int, asyncio.Task] = {}  # key = id(websocket)
 # Server selection state
 _room_latency_reports: Dict[str, Dict[str, Dict[str, int]]] = {} # room_id -> {player_id: {server_url: latency_ms}}
 _server_selection_tasks: Dict[str, asyncio.Task] = {}
+_server_switch_ack_locks: Dict[str, asyncio.Lock] = {}
+_SERVER_SELECTION_REPORT_TIMEOUT_SECONDS = 10
+
+
+async def _server_selection_urls() -> list[str]:
+    """Return the canonical server list configured by the backend from Firebase config.
+    """
+    try:
+        from app.services.remote_config_service import remote_config_service
+        template, _ = await remote_config_service.get_template()
+        configured = template.get("parameters", {}).get("servers_list", {}).get("defaultValue", {}).get("value", "")
+        
+        if configured:
+            import json
+            values = json.loads(configured)
+            urls: list[str] = []
+            for value in values:
+                if isinstance(value, dict) and "url" in value:
+                    url = value["url"].strip().rstrip("/")
+                    if url.startswith(("http://", "https://")) and url not in urls:
+                        urls.append(url)
+            if urls:
+                return urls
+    except Exception as e:
+        from app.utils.room_logger import global_log
+        global_log.error("server_selection_urls_error", {"error": str(e)})
+
+    # Hardcoded fallback servers for local testing
+    return [
+        "https://least-count-rush-lax.fly.dev",
+        "https://least-count-rush-backend.fly.dev",
+    ]
+
+
+def _server_selection_key(room_id: str) -> str:
+    return f"rooms:server_selection:{room_id}"
 
 # Empty room deletion timers
 _empty_room_timers: Dict[str, asyncio.Task] = {}
@@ -402,6 +441,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = ""
                 await handle_chat_message(websocket, room_id, data)
             elif message_type == "latency_report":
                 await handle_latency_report(websocket, room_id, data)
+            elif message_type == "server_switch_ack":
+                await handle_server_switch_ack(websocket, room_id, data)
             else:
                 log.warn("ws_unknown_message_type", {"msg_type": message_type, "player_id": player_id})
                 await manager.send_personal_message({
@@ -1011,6 +1052,20 @@ async def handle_latency_report(websocket: WebSocket, room_id: str, data: Dict):
         return
     
     latencies = data.get("latencies", {})
+    if not isinstance(latencies, dict):
+        get_room_logger(room_id).warning("invalid_latency_report", {
+            "player_id": player_id,
+        })
+        return
+
+    # Only retain numeric, non-negative measurements.  This prevents a
+    # malformed client report from breaking or skewing server selection.
+    latencies = {
+        str(url): latency
+        for url, latency in latencies.items()
+        if isinstance(latency, (int, float)) and not isinstance(latency, bool)
+        and latency >= 0
+    }
     if room_id not in _room_latency_reports:
         _room_latency_reports[room_id] = {}
     
@@ -1024,67 +1079,166 @@ async def _start_server_selection(room_id: str, room):
     """Initiates server selection and then starts the game."""
     log = get_room_logger(room_id)
     log.info("start_server_selection", {"room_id": room_id})
+
+    server_urls = await _server_selection_urls()
+    if not server_urls:
+        log.error("server_selection_no_servers_configured")
+        await manager.broadcast_to_room({
+            "type": "error",
+            "message": "No game servers are configured.",
+        }, room_id)
+        return
+
+    if len(server_urls) == 1:
+        log.info("server_selection_single_server", {"server_url": server_urls[0]})
+        await game_ws.start_game_for_room(room_id)
+        return
+
+    is_public = room.room_type.value == "public"
+    expected_players = [
+        p.player_id
+        for p in room.players
+        if not is_public or p.is_connected
+    ]
+    if len(expected_players) < 2:
+        return
     
-    # Broadcast find_best_server. We pass empty list so client uses its cached servers list.
+    # Reset the accumulator *before* notifying clients.  A client can reply as
+    # soon as its WebSocket receives this broadcast; resetting it afterwards
+    # loses those fast reports and makes selection appear to do nothing.
+    _room_latency_reports[room_id] = {}
+
+    # The backend is the source of truth for candidates. Every client measures
+    # this exact list, so the final sums are comparable.
     await manager.broadcast_to_room({
         "type": "find_best_server",
         "data": {
-            "servers": []
+            "servers": server_urls,
         }
     }, room_id)
     
-    _room_latency_reports[room_id] = {}
-    
-    # Wait for up to 3 seconds for all players to report
-    wait_time = 0
-    is_public = room.room_type.value == "public"
-    expected_players = [p.player_id for p in room.players if p.is_connected] if is_public else [p.player_id for p in room.players]
-    
-    while wait_time < 30:
+    # Clients allow each parallel HTTP probe up to five seconds.  Keep the
+    # collection window slightly longer, otherwise timeout reports routinely
+    # arrive after selection has already completed.
+    wait_time = 0.0
+    while wait_time < _SERVER_SELECTION_REPORT_TIMEOUT_SECONDS:
         reports = _room_latency_reports.get(room_id, {})
         has_all = all(pid in reports for pid in expected_players)
         if has_all and len(expected_players) > 0:
             break
         await asyncio.sleep(0.1)
-        wait_time += 1
+        wait_time += 0.1
         
     reports = _room_latency_reports.get(room_id, {})
+    if not all(player_id in reports for player_id in expected_players):
+        log.warning("server_selection_reports_timed_out", {
+            "expected_players": expected_players,
+            "reporting_players": list(reports),
+        })
+        _room_latency_reports.pop(room_id, None)
+        await manager.broadcast_to_room({
+            "type": "error",
+            "message": "Server selection timed out. Please ready up again.",
+        }, room_id)
+        return
+
     log.info("server_selection_reports_gathered", {"reports": reports})
     
     best_server = None
     if reports:
-        # Aggregate latencies
-        # Structure: {server_url: sum_of_latencies}
-        # Only consider servers that were reported by ALL players who responded
-        server_sums = {}
-        for pid, latencies in reports.items():
-            for url, latency in latencies.items():
-                if latency < 9999: # 9999 is the fail state in client
-                    server_sums[url] = server_sums.get(url, 0) + latency
-                else:
-                    server_sums[url] = server_sums.get(url, 0) + 10000 # Penalize unreachable servers
-        
+        # Compare only servers measured by every responding player.  Summing a
+        # URL reported by just one client biases selection toward a server that
+        # other players did not measure (or cannot reach).
+        common_servers = set.intersection(
+            *(set(latencies) for latencies in reports.values())
+        )
+        server_sums = {
+            url: sum(
+                10000 if latencies[url] >= 9999 else latencies[url]
+                for latencies in reports.values()
+            )
+            for url in common_servers
+        }
+
         if server_sums:
             best_server = min(server_sums.keys(), key=lambda k: server_sums[k])
             log.info("best_server_selected", {"best_server": best_server, "server_sums": server_sums})
     
-    if best_server:
+    if not best_server:
+        log.error("server_selection_no_common_server", {"reports": reports})
+        _room_latency_reports.pop(room_id, None)
         await manager.broadcast_to_room({
-            "type": "server_switch",
-            "data": {
-                "server_url": best_server,
-                "server_region": "" # Optional region if available, client will use url
-            }
+            "type": "error",
+            "message": "No server is reachable by every player. Please try again.",
         }, room_id)
-        
-        # Wait grace period for clients to reconnect
-        await asyncio.sleep(2.5)
-    
-    # Clean up
-    _room_latency_reports.pop(room_id, None)
-    
-    log.info("server_selection_complete_starting_game", {"room_id": room_id})
-    game_started = await game_ws.start_game_for_room(room_id)
-    if not game_started:
-        log.error("auto_game_start_failed_after_selection")
+        return
 
+    # This state is shared by every backend instance. Clients reconnect to the
+    # selected server and acknowledge there; that server starts the game once
+    # all expected players have arrived.
+    await redis_client.set(
+        _server_selection_key(room_id),
+        json.dumps({
+            "server_url": best_server,
+            "expected_players": expected_players,
+            "acknowledged_players": [],
+            "started": False,
+        }),
+        ex=KEY_TTL_SECONDS,
+    )
+
+    await manager.broadcast_to_room({
+        "type": "server_switch",
+        "data": {
+            "server_url": best_server,
+            "server_region": "",
+        },
+    }, room_id)
+
+    _room_latency_reports.pop(room_id, None)
+
+
+async def handle_server_switch_ack(websocket: WebSocket, room_id: str, data: Dict):
+    """Record a selected-server reconnection and start exactly once when ready."""
+    player_id = manager.get_player_id(websocket)
+    if not player_id:
+        return
+
+    key = _server_selection_key(room_id)
+    lock = _server_switch_ack_locks.setdefault(room_id, asyncio.Lock())
+    async with lock:
+        raw_state = await redis_client.get(key)
+        if not raw_state:
+            return
+        try:
+            state = json.loads(raw_state)
+        except (TypeError, json.JSONDecodeError):
+            get_room_logger(room_id).error("invalid_server_selection_state")
+            return
+
+        expected_players = state.get("expected_players", [])
+        if player_id not in expected_players or state.get("started"):
+            return
+
+        acknowledged_players = set(state.get("acknowledged_players", []))
+        acknowledged_players.add(player_id)
+        state["acknowledged_players"] = sorted(acknowledged_players)
+
+        if set(expected_players).issubset(acknowledged_players):
+            state["started"] = True
+
+        await redis_client.set(key, json.dumps(state), ex=KEY_TTL_SECONDS)
+        log = get_room_logger(room_id)
+        log.info("server_switch_acknowledged", {
+            "player_id": player_id,
+            "acknowledged_count": len(acknowledged_players),
+            "expected_count": len(expected_players),
+        })
+
+        if state["started"]:
+            log.info("server_switch_all_acknowledged_starting_game")
+            game_started = await game_ws.start_game_for_room(room_id)
+            if not game_started:
+                state["started"] = False
+                await redis_client.set(key, json.dumps(state), ex=KEY_TTL_SECONDS)
+                log.error("auto_game_start_failed_after_server_switch")
