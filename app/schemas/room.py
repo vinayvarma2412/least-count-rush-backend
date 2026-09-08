@@ -58,7 +58,11 @@ class PlayerInfo(BaseModel):
     is_in_game: bool = Field(default=False, description="True if player has entered the game view (in room or exited)")
     disconnect_at: Optional[datetime] = Field(
         default=None,
-        description="Timestamp when player last disconnected; cleared to None on reconnect"
+        description="Timestamp when player disconnected. Null if connected."
+    )
+    connection_id: Optional[str] = Field(
+        default=None,
+        description="Globally unique UUID for the current WebSocket connection."
     )
     is_exited: bool = Field(
         default=False,
