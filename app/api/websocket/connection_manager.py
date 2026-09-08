@@ -19,9 +19,11 @@ class ConnectionManager:
         self.connection_rooms: Dict[WebSocket, str] = {}
         # WebSocket -> player_id mapping
         self.connection_players: Dict[WebSocket, str] = {}
+        # WebSocket -> globally unique connection_id
+        self.connection_ids: Dict[WebSocket, str] = {}
         # Per-websocket lock to prevent concurrent ASGI sends
         self.ws_locks: Dict[WebSocket, asyncio.Lock] = {}
-        # Callback for when a player disconnects (room_id, player_id)
+        # Callback for when a player disconnects (room_id, player_id, websocket)
         self.on_disconnect_callback = None
 
     def set_disconnect_callback(self, callback):
@@ -58,6 +60,7 @@ class ConnectionManager:
 
         self.connection_rooms.pop(websocket, None)
         self.connection_players.pop(websocket, None)
+        connection_id = self.connection_ids.pop(websocket, None)
         self.ws_locks.pop(websocket, None)
 
         # Only call callback if we have both room_id and player_id (player was actually joined)
@@ -72,11 +75,11 @@ class ConnectionManager:
                 if asyncio.iscoroutinefunction(self.on_disconnect_callback):
                     try:
                         loop = asyncio.get_running_loop()
-                        loop.create_task(self.on_disconnect_callback(room_id, player_id, websocket))
+                        loop.create_task(self.on_disconnect_callback(room_id, player_id, websocket, connection_id))
                     except RuntimeError:
-                        asyncio.run(self.on_disconnect_callback(room_id, player_id, websocket))
+                        asyncio.run(self.on_disconnect_callback(room_id, player_id, websocket, connection_id))
                 else:
-                    self.on_disconnect_callback(room_id, player_id, websocket)
+                    self.on_disconnect_callback(room_id, player_id, websocket, connection_id)
 
     async def send_personal_message(self, message: dict, websocket: WebSocket):
         """Send a message to a specific WebSocket connection"""

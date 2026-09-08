@@ -7,6 +7,7 @@ from typing import Dict
 import asyncio
 import json
 import os
+import uuid
 from app.api.websocket.connection_manager import manager
 from app.utils.lock import with_room_lock, get_room_lock
 from app.services.room_service import room_service
@@ -111,21 +112,36 @@ async def _broadcast_room_update_on_disconnect(room_id: str):
 
 
 @with_room_lock
-async def on_player_disconnect(room_id: str, player_id: str, websocket=None):
+async def on_player_disconnect(room_id: str, player_id: str, websocket=None, connection_id=None):
     """Callback when a player disconnects from connection manager."""
     if player_id:
-        # Check if the player has any OTHER active connections (e.g. they just reconnected)
+        # 1. Check if the player has any OTHER active connections on THIS server
         active_connections = manager.get_room_connections(room_id)
-        player_still_connected = any(
+        player_still_connected_local = any(
             manager.connection_players.get(ws) == player_id
             for ws in active_connections
         )
         
-        if player_still_connected:
-            get_room_logger(room_id).info("player_disconnect_ignored_active_connection_exists", {
+        if player_still_connected_local:
+            get_room_logger(room_id).info("player_disconnect_ignored_active_connection_exists_local", {
                 "player_id": player_id,
             })
             return
+
+        # 2. Check if a newer connection for this player has been established globally (e.g. on another server)
+        # by checking if the connection_id in Redis matches the one that just disconnected.
+        room = await room_service.get_room(room_id)
+        if room:
+            p = next((x for x in room.players + room.waiting_players if x.player_id == player_id), None)
+            if p:
+                current_connection_id = p.model_dump().get("connection_id") if hasattr(p, "model_dump") else p.connection_id if hasattr(p, "connection_id") else (p.get("connection_id") if isinstance(p, dict) else None)
+                if connection_id and current_connection_id and connection_id != current_connection_id:
+                    get_room_logger(room_id).info("player_disconnect_ignored_newer_connection_exists_global", {
+                        "player_id": player_id,
+                        "old_connection": connection_id,
+                        "new_connection": current_connection_id,
+                    })
+                    return
 
         await room_service.set_player_connected(room_id, player_id, False)
         # Record disconnect timestamp for countdown badge
@@ -513,6 +529,8 @@ async def handle_join_room(websocket: WebSocket, room_id: str, data: Dict):
 
     # Update connection mapping
     manager.connection_players[websocket] = player_id
+    connection_id = str(uuid.uuid4())
+    manager.connection_ids[websocket] = connection_id
     log_to_file("handle_join_room: checking player exists")
     player_exists = await room_service.player_exists(room_id, player_id)
     log_to_file(f"handle_join_room: player_exists={player_exists}")
@@ -522,7 +540,7 @@ async def handle_join_room(websocket: WebSocket, room_id: str, data: Dict):
 
         if success:
             # Force is_connected=True if needed
-            await room_service.update_player_fields(room_id, player_id, is_connected=True)
+            await room_service.update_player_fields(room_id, player_id, is_connected=True, connection_id=connection_id)
     else:
         # Player already in room — reconnecting
         connected_result = await room_service.set_player_connected(room_id, player_id, True)
@@ -536,7 +554,7 @@ async def handle_join_room(websocket: WebSocket, room_id: str, data: Dict):
             await room_service.update_player_fields(room_id, player_id, **updates)
 
         # Force is_connected=True if still not set
-        await room_service.update_player_fields(room_id, player_id, is_connected=True)
+        await room_service.update_player_fields(room_id, player_id, is_connected=True, connection_id=connection_id)
 
         log.info("player_reconnected", {
             "player_id": player_id,
