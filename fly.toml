@@ -3,8 +3,8 @@
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = "leastcountrush"
-primary_region = "sin"
+app = "leastcountrush-lax"
+primary_region = "lax"
 
 [http_service]
 auto_start_machines = true

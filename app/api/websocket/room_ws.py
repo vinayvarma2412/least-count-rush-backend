@@ -722,8 +722,10 @@ async def handle_player_ready(websocket: WebSocket, room_id: str, data: Dict):
         if is_public:
             active_players = [p for p in room.players if p.is_connected]
             all_ready = len(active_players) >= 2 and all(player.is_ready for player in active_players)
+            print(f"DEBUG: [Public] len(active_players)={len(active_players)}, all_ready={all_ready}")
         else:
             all_ready = len(room.players) >= 2 and all(player.is_ready for player in room.players)
+            print(f"DEBUG: [Private] len(room.players)={len(room.players)}, all_ready={all_ready}")
 
         if all_ready and room.status != RoomStatus.WAITING:
             # All players are in the lobby and ready, but room is not WAITING.
@@ -759,6 +761,7 @@ async def handle_player_ready(websocket: WebSocket, room_id: str, data: Dict):
                 })
                 # Check if enough players (at least 2)
                 if len(active_players if is_public else room.players) >= 2:
+                    print(f"DEBUG: Launching _start_server_selection for room {room_id}")
                     if room_id not in _server_selection_tasks or _server_selection_tasks[room_id].done():
                         _server_selection_tasks[room_id] = asyncio.create_task(
                             _start_server_selection(room_id, room)
@@ -1087,6 +1090,7 @@ async def handle_latency_report(websocket: WebSocket, room_id: str, data: Dict):
 async def _start_server_selection(room_id: str, room):
     """Initiates server selection and then starts the game."""
     log = get_room_logger(room_id)
+    print(f"DEBUG: _start_server_selection called for room {room_id}")
     log.info("start_server_selection", {"room_id": room_id})
 
     server_urls = await _server_selection_urls()
