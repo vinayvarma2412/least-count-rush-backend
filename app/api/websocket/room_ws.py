@@ -35,29 +35,7 @@ _SERVER_SELECTION_REPORT_TIMEOUT_SECONDS = 10
 
 
 async def _server_selection_urls() -> list[str]:
-    """Return the canonical server list configured by the backend from Firebase config.
-    """
-    try:
-        from app.services.remote_config_service import remote_config_service
-        template, _ = await remote_config_service.get_template()
-        configured = template.get("parameters", {}).get("servers_list", {}).get("defaultValue", {}).get("value", "")
-        
-        if configured:
-            import json
-            values = json.loads(configured)
-            urls: list[str] = []
-            for value in values:
-                if isinstance(value, dict) and "url" in value:
-                    url = value["url"].strip().rstrip("/")
-                    if url.startswith(("http://", "https://")) and url not in urls:
-                        urls.append(url)
-            if urls:
-                return urls
-    except Exception as e:
-        from app.utils.room_logger import global_log
-        global_log.error("server_selection_urls_error", {"error": str(e)})
-
-    # Hardcoded fallback servers for local testing
+    """Return the canonical server list. Unconditionally hardcoded for testing."""
     return [
         "https://least-count-rush-lax.fly.dev",
         "https://least-count-rush-backend.fly.dev",
@@ -711,11 +689,18 @@ async def handle_player_ready(websocket: WebSocket, room_id: str, data: Dict):
     if success:
         room = await room_service.get_room(room_id)
         is_public = room.room_type.value == "public"
+        
+        # Debug printing
+        print(f"DEBUG: handle_player_ready - room_id={room_id}, player_id={player_id}, is_ready={is_ready}")
+        print(f"DEBUG: room.status={room.status}, len(room.players)={len(room.players)}")
+
         if is_public:
             active_players = [p for p in room.players if p.is_connected]
             all_ready = len(active_players) >= 2 and all(player.is_ready for player in active_players)
+            print(f"DEBUG: [Public] len(active_players)={len(active_players)}, all_ready={all_ready}")
         else:
             all_ready = len(room.players) >= 2 and all(player.is_ready for player in room.players)
+            print(f"DEBUG: [Private] len(room.players)={len(room.players)}, all_ready={all_ready}")
 
         if all_ready and room.status != RoomStatus.WAITING:
             # All players are in the lobby and ready, but room is not WAITING.
@@ -739,7 +724,9 @@ async def handle_player_ready(websocket: WebSocket, room_id: str, data: Dict):
             else:
                 all_in_game = all((player.is_in_game or not player.is_connected) for player in room.players)
 
-            if all_ready and all_in_game:
+            print(f"DEBUG: all_ready={all_ready}, all_in_game={all_in_game}")
+
+            if all_ready:
                 if is_public:
                     # Proceed straight to game if public, since public rooms might not need the server switch again
                     # Actually, we should find best server for public games too.
@@ -750,6 +737,7 @@ async def handle_player_ready(websocket: WebSocket, room_id: str, data: Dict):
                 })
                 # Check if enough players (at least 2)
                 if len(active_players if is_public else room.players) >= 2:
+                    print(f"DEBUG: Launching _start_server_selection for room {room_id}")
                     if room_id not in _server_selection_tasks or _server_selection_tasks[room_id].done():
                         _server_selection_tasks[room_id] = asyncio.create_task(
                             _start_server_selection(room_id, room)
@@ -1078,6 +1066,7 @@ async def handle_latency_report(websocket: WebSocket, room_id: str, data: Dict):
 async def _start_server_selection(room_id: str, room):
     """Initiates server selection and then starts the game."""
     log = get_room_logger(room_id)
+    print(f"DEBUG: _start_server_selection called for room {room_id}")
     log.info("start_server_selection", {"room_id": room_id})
 
     server_urls = await _server_selection_urls()
@@ -1101,6 +1090,7 @@ async def _start_server_selection(room_id: str, room):
         if not is_public or p.is_connected
     ]
     if len(expected_players) < 2:
+        print(f"DEBUG: expected_players < 2 ({len(expected_players)}). Aborting server selection.")
         return
     
     # Reset the accumulator *before* notifying clients.  A client can reply as
