@@ -17,6 +17,13 @@ from app.utils.room_logger import get_room_logger
 # One running task per room_id
 _turn_timer_tasks: Dict[str, asyncio.Task] = {}
 
+# Acks for synchronized turn auto-play
+_turn_disabled_acks: Dict[str, asyncio.Event] = {}
+
+def set_turn_disabled_ack(room_id: str):
+    if room_id in _turn_disabled_acks:
+        _turn_disabled_acks[room_id].set()
+
 
 def start_turn_timer(room_id: str) -> None:
     """Cancel any existing timer for the room and start a fresh one."""
@@ -106,10 +113,21 @@ async def _turn_timer_loop(room_id: str) -> None:
                 }, room_id)
                 log.info("turn_disabled_broadcast", {"player_index": player_index})
 
-            # GAP: Release the lock and wait 1.5 seconds. 
-            # This gives in-flight requests (like a user clicking just before receiving turn_disabled)
-            # time to reach the server, acquire the lock, and process.
-            await asyncio.sleep(1.5)
+                room = await room_service.get_room(room_id)
+                is_connected = False
+                if room and player_index < len(room.players):
+                    is_connected = room.players[player_index].is_connected
+
+            if is_connected:
+                ack_event = asyncio.Event()
+                _turn_disabled_acks[room_id] = ack_event
+                try:
+                    await asyncio.wait_for(ack_event.wait(), timeout=2.5)
+                    log.info("turn_disabled_ack_received", {"player_index": player_index})
+                except asyncio.TimeoutError:
+                    log.info("turn_disabled_ack_timeout", {"player_index": player_index})
+                finally:
+                    _turn_disabled_acks.pop(room_id, None)
 
             # Phase 2: Server bot takes action if the user didn't play during the gap
             async with get_room_lock(room_id):
@@ -119,12 +137,6 @@ async def _turn_timer_loop(room_id: str) -> None:
                     return
                 if gs_fresh.current_turn != player_index:
                     log.info("turn_timer_stale_turn_already_advanced_after_gap", {"room_id": room_id})
-                    return
-                # Check if the user initiated an action (like dropping a card) but hasn't finished the turn
-                if gs_fresh.turn_context and gs_fresh.turn_context.actions:
-                    log.info("turn_timer_user_played_during_gap", {"room_id": room_id})
-                    # Give them more time to finish their compound action, restart timer
-                    start_turn_timer(room_id)
                     return
 
                 # 1. Rollback any partial move (although we just checked there shouldn't be any, safe to call)

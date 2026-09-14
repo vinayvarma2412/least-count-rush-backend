@@ -576,6 +576,21 @@ class RoomService:
         await self._save_room(room)
         return True
 
+    async def update_room_server_info(self, room_id: str, server_url: str, server_region: str) -> bool:
+        """Update room server url and region."""
+        room = await self._load_room(room_id)
+        if not room:
+            return False
+
+        room["server_url"] = server_url
+        room["server_region"] = server_region
+        get_room_logger(room_id).info("room_server_info_updated", {
+            "server_url": server_url,
+            "server_region": server_region,
+        })
+        await self._save_room(room)
+        return True
+
     async def has_connected_players(self, room_id: str) -> bool:
         """Check if room has any connected players."""
         room = await self._load_room(room_id)
@@ -611,11 +626,18 @@ class RoomService:
         return True
 
     async def find_open_public_room(self) -> Optional[str]:
-        """Find the first open public room that is WAITING and not full.
+        """Find the first open public room eligible for matchmaking.
 
-        Returns the room_id of an eligible room, or None if no such room exists.
-        Stale entries in rooms:public_index are cleaned up lazily.
+        Eligibility rules (ALL must pass):
+          0. Room type is PUBLIC
+          1. Status is WAITING
+          2. At least 1 player is actively connected (is_connected=True, disconnect_at=None)
+          3. Room was created less than 1 hour ago
+          4. Room is not full
         """
+        now = datetime.now(timezone.utc)
+        max_age_seconds = 3600  # 1 hour
+
         room_ids = await redis_client.smembers("rooms:public_index")
         for room_id in room_ids:
             room = await self._load_room(room_id)
@@ -625,16 +647,46 @@ class RoomService:
                 await redis_client.srem("rooms:index", room_id)
                 continue
 
+            # ── Rule 0: must be PUBLIC ───────────────────────────────────────
+            room_type = room.get("room_type")
+            is_public = room_type in (RoomType.PUBLIC, RoomType.PUBLIC.value, "public")
+            if not is_public:
+                continue
+
+            # ── Rule 1: must be WAITING ──────────────────────────────────────
             status = room.get("status")
             is_waiting = status in (RoomStatus.WAITING, RoomStatus.WAITING.value, "waiting")
             if not is_waiting:
-                # Room already started or finished — remove from public index
                 await redis_client.srem("rooms:public_index", room_id)
                 continue
 
-            total_players = len(room.get("players", [])) + len(room.get("waiting_players", []))
+            # ── Rule 2: at least 1 active player ────────────────────────────
+            all_players = room.get("players", []) + room.get("waiting_players", [])
+            if not all_players:
+                # Empty room — skip, a fresh one will be created
+                continue
+
+            has_active_player = any(
+                p.get("is_connected") and not p.get("disconnect_at")
+                for p in all_players
+            )
+            if not has_active_player:
+                # All players offline / in grace period — skip
+                continue
+
+            # ── Rule 3: room age < 1 hour ────────────────────────────────────
+            created_at = room.get("created_at")
+            if created_at:
+                if not created_at.tzinfo:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                if (now - created_at).total_seconds() >= max_age_seconds:
+                    # Stale room — remove from matchmaking pool
+                    await redis_client.srem("rooms:public_index", room_id)
+                    continue
+
+            # ── Rule 4: not full ─────────────────────────────────────────────
+            total_players = len(all_players)
             if total_players >= room.get("max_players", 6):
-                # Room is full — remove from public index so future searches skip it
                 await redis_client.srem("rooms:public_index", room_id)
                 continue
 

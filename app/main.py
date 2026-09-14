@@ -191,6 +191,11 @@ async def root():
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
+    import os, asyncio
+    # Add intentional latency for testing if running on port 8000
+    if os.environ.get("PORT") == "8000":
+        await asyncio.sleep(2.0)
+        
     from app.services.redis_client import BACKEND_NAME, USE_REDIS
     return {
         "status": "healthy",

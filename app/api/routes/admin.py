@@ -183,6 +183,8 @@ async def get_dashboard_stats_ads(
     ad_rewarded_today = 0
     ad_interstitial_today = 0
     ad_banner_today = 0
+    ad_play_with_randoms_rewarded_today = 0
+    ad_play_with_bot_rewarded_interstitial_today = 0
     
     for placement, total_count in ad_impressions_rows:
         if placement == AdPlacementEnum.rewarded:
@@ -191,11 +193,17 @@ async def get_dashboard_stats_ads(
             ad_interstitial_today = total_count or 0
         elif placement == AdPlacementEnum.banner:
             ad_banner_today = total_count or 0
+        elif placement == AdPlacementEnum.play_with_randoms_rewarded:
+            ad_play_with_randoms_rewarded_today = total_count or 0
+        elif placement == AdPlacementEnum.play_with_bot_rewarded_interstitial:
+            ad_play_with_bot_rewarded_interstitial_today = total_count or 0
 
     return AdminStatsAdsResponse(
         ad_rewarded_today=ad_rewarded_today,
         ad_interstitial_today=ad_interstitial_today,
         ad_banner_today=ad_banner_today,
+        ad_play_with_randoms_rewarded_today=ad_play_with_randoms_rewarded_today,
+        ad_play_with_bot_rewarded_interstitial_today=ad_play_with_bot_rewarded_interstitial_today,
     )
 
 

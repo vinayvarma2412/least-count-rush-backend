@@ -86,6 +86,11 @@ async def _empty_room_timeout(room_id: str):
     except asyncio.CancelledError:
         pass
 
+def start_empty_room_timer(room_id: str):
+    if room_id in _empty_room_timers:
+        _empty_room_timers[room_id].cancel()
+    _empty_room_timers[room_id] = asyncio.create_task(_empty_room_timeout(room_id))
+
 # Maximum seconds allowed between pings before the connection is declared dead.
 # Flutter client sends a ping every 30 s; allow 2 missed pings + 10 s buffer → 70 s.
 _PING_TIMEOUT_SECONDS = 70
@@ -154,18 +159,17 @@ async def on_player_disconnect(room_id: str, player_id: str, websocket=None, con
                 "player_id": player_id,
             })
 
-        # Roll back mid-turn state if player disconnected after drawing but before discarding
-        room = await room_service.get_room(room_id)
-        if room and room.room_type.value == "public" and room.status == RoomStatus.WAITING:
+        # Remove player from room if they stay offline while in WAITING state
+        if room and room.status == RoomStatus.WAITING:
             async def _delayed_remove(r_id, p_id):
-                await asyncio.sleep(30)
+                await asyncio.sleep(15)  # Wait 15 seconds for reconnect
                 async with get_room_lock(r_id):
                     current_r = await room_service.get_room(r_id)
                     if not current_r or current_r.status != RoomStatus.WAITING:
                         return
                     p = next((x for x in current_r.players + current_r.waiting_players if x.player_id == p_id), None)
                     if p and not p.is_connected:
-                        get_room_logger(r_id).info("public_room_delayed_player_removal", {"player_id": p_id})
+                        get_room_logger(r_id).info("waiting_room_delayed_player_removal", {"player_id": p_id})
                         removed = await room_service.force_remove_player(r_id, p_id)
                         if removed:
                             updated_r = await room_service.get_room(r_id)
@@ -639,11 +643,8 @@ async def handle_join_room(websocket: WebSocket, room_id: str, data: Dict):
                     "player_name": player_name,
                 })
 
-        if room.status == RoomStatus.WAITING and len(room.players) >= 2:
-            if room_id not in _server_selection_tasks or _server_selection_tasks[room_id].done():
-                _server_selection_tasks[room_id] = asyncio.create_task(
-                    _start_server_selection(room_id, room)
-                )
+        if not player_exists and room.status == RoomStatus.WAITING and len(room.players) >= 2:
+            pass # Server selection is now handled in handle_set_ready when everyone clicks Ready
     else:
         await manager.send_personal_message({
             "type": "error",
@@ -760,11 +761,17 @@ async def handle_player_ready(websocket: WebSocket, room_id: str, data: Dict):
         }, room_id)
 
         if room.status == RoomStatus.WAITING:
+            if all_ready and len(room.players) >= 2:
+                # Trigger server selection once everyone is ready
+                if room_id not in _server_selection_tasks or _server_selection_tasks[room_id].done():
+                    _server_selection_tasks[room_id] = asyncio.create_task(
+                        _start_server_selection(room_id, room)
+                    )
+
             if is_public:
                 all_in_game = all(player.is_in_game for player in active_players)
             else:
                 all_in_game = all((player.is_in_game or not player.is_connected) for player in room.players)
-
 
             if all_ready and all_in_game:
                 if is_public:
@@ -772,15 +779,10 @@ async def handle_player_ready(websocket: WebSocket, room_id: str, data: Dict):
                     # Actually, we should find best server for public games too.
                     # But the requirement is that it finds the best server for *all* players.
                     pass
-                log.info("triggering_server_selection", {
+                log.info("game_ready_conditions_met", {
                     "player_count": len(room.players),
                 })
-                # Check if enough players (at least 2)
-                if len(active_players if is_public else room.players) >= 2:
-                    if room_id not in _server_selection_tasks or _server_selection_tasks[room_id].done():
-                        _server_selection_tasks[room_id] = asyncio.create_task(
-                            _start_server_selection(room_id, room)
-                        )
+                # Server selection is exclusively handled in handle_join_room when a NEW player joins.
     else:
         await manager.send_personal_message({
             "type": "error",
@@ -810,6 +812,12 @@ async def handle_player_action(websocket: WebSocket, room_id: str, data: Dict):
 
     action_type = data.get("action_type", "")
     card_data = data.get("card")
+
+    if action_type == "turn_disabled_ack":
+        from app.api.websocket.turn_timer import set_turn_disabled_ack
+        log.info("player_action_turn_disabled_ack_received", {"player_id": player_id})
+        set_turn_disabled_ack(room_id)
+        return
 
     # Silently drop relay-blocked actions — they are for local UI use only.
     if action_type in _RELAY_BLOCKED_ACTIONS:
@@ -1117,15 +1125,14 @@ async def _start_server_selection(room_id: str, room):
         return
 
     if len(server_urls) == 1:
-        log.info("server_selection_single_server", {"server_url": server_urls[0]})
-        await game_ws.start_game_for_room(room_id)
+        log.info("server_selection_single_server_skipped", {"server_url": server_urls[0]})
         return
 
-    is_public = room.room_type.value == "public"
+    # We can only measure latency from players who are currently connected
     expected_players = [
         p.player_id
         for p in room.players
-        if not is_public or p.is_connected
+        if p.is_connected
     ]
     if len(expected_players) < 2:
         return
@@ -1158,9 +1165,9 @@ async def _start_server_selection(room_id: str, room):
         
     reports = _room_latency_reports.get(room_id, {})
     if not all(player_id in reports for player_id in expected_players):
-        log.warning("server_selection_reports_timed_out", {
-            "expected_players": expected_players,
-            "reporting_players": list(reports),
+        log.warn("server_selection_reports_timed_out", {
+            "expected": len(expected_players),
+            "received": len(reports)
         })
         _room_latency_reports.pop(room_id, None)
         await manager.broadcast_to_room({
@@ -1214,11 +1221,15 @@ async def _start_server_selection(room_id: str, room):
         ex=KEY_TTL_SECONDS,
     )
 
+    # Persist the best server to the room state so rejoiners connect directly to the correct server
+    server_region = room.server_region if hasattr(room, "server_region") and room.server_region else ""
+    await room_service.update_room_server_info(room_id, best_server, server_region)
+
     await manager.broadcast_to_room({
         "type": "server_switch",
         "data": {
             "server_url": best_server,
-            "server_region": "",
+            "server_region": room.server_region if hasattr(room, "server_region") and room.server_region else "",
         },
     }, room_id)
 

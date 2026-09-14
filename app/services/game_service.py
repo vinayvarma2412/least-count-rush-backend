@@ -10,7 +10,7 @@ import random
 from datetime import datetime, timezone
 from typing import Optional, List, Dict
 from app.services.room_service import room_service
-from app.schemas.room import RoomStatus
+from app.schemas.room import RoomStatus, RoomType
 from app.schemas.game import GameState, TurnContext
 from app.utils.room_logger import get_room_logger
 from app.utils.deck_utils import (
@@ -142,7 +142,7 @@ class GameService:
                 for i in range(num_players)
             ],
             turn_started_at=datetime.now(timezone.utc),
-            turn_timeout_seconds=TURN_TIMEOUT_SECONDS,
+            turn_timeout_seconds=15 if room.room_type == RoomType.PUBLIC else TURN_TIMEOUT_SECONDS,
         )
 
         await self._save(room_id, game_state)

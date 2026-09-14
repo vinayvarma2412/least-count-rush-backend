@@ -42,12 +42,42 @@ async def matchmake(
         if room:
             return room
 
-    # No open public room found — create one with Tournament defaults
+    import logging
+    from app.services.remote_config_service import remote_config_service
+
+    max_players = 6
+    score_limit = 100
+    game_mode = "Tournament"
+    try:
+        template, _ = await remote_config_service.get_template()
+        params = template.get("parameters", {})
+        
+        limit_str = params.get("randoms_room_limit", {}).get("defaultValue", {}).get("value")
+        if limit_str and limit_str.isdigit():
+            score_limit = int(limit_str)
+            
+        players_str = params.get("randoms_room_players", {}).get("defaultValue", {}).get("value")
+        if players_str and players_str.isdigit():
+            max_players = int(players_str)
+            
+        type_str = params.get("randoms_room_type", {}).get("defaultValue", {}).get("value")
+        if type_str:
+            if type_str.title() == "Single":
+                game_mode = "Single Game"
+            elif type_str.title() == "Tournament":
+                game_mode = "Tournament"
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Failed to fetch remote config for randoms room: {e}")
+
+    if game_mode == "Single Game":
+        score_limit = None
+
+    # No open public room found — create one with defaults (or remote config)
     room_data = RoomCreate(
-        max_players=6,
+        max_players=max_players,
         room_name=None,
-        game_mode="Tournament",
-        score_limit=100,
+        game_mode=game_mode,
+        score_limit=score_limit,
         creator_app_version=request.creator_app_version,
         creator_build_number=request.creator_build_number,
         room_type=RoomType.PUBLIC,

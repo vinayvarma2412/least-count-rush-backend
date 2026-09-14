@@ -49,6 +49,8 @@ class AdPlacementEnum(str, enum.Enum):
     rewarded     = "rewarded"
     banner       = "banner"
     interstitial = "interstitial"
+    play_with_randoms_rewarded = "play_with_randoms_rewarded"
+    play_with_bot_rewarded_interstitial = "play_with_bot_rewarded_interstitial"
 
 # --- Models ---
 

@@ -1,7 +1,11 @@
+import sys
+import os
+import httpx
 import asyncio
-from httpx import AsyncClient
 
-async def test():
-    async with AsyncClient() as client:
-        # First we need to simulate the request. But wait, it needs authentication.
+async def main():
+    async with httpx.AsyncClient() as client:
+        # We need a token. Let's just create a test route or bypass auth in the script.
         pass
+
+asyncio.run(main())
