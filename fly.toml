@@ -1,17 +1,17 @@
-# fly.toml app configuration file generated for leastcountrush on 2026-08-09T18:36:49Z
+# fly.toml app configuration file generated for leastcountrush on 2026-09-26T15:23:09Z
 #
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+# See https://docs.fly.io/reference/configuration for information about how to use this file.
 #
 
 app = "leastcountrush"
-primary_region = "sin"
+primary_region = 'sin'
 
 [http_service]
 auto_start_machines = true
-auto_stop_machines = true
+auto_stop_machines = 'stop'
 force_https = true
 internal_port = 8080
-min_machines_running = 0
+min_machines_running = 1
 processes = ['app']
 
 [[vm]]
