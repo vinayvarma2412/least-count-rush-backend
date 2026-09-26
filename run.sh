@@ -35,29 +35,45 @@ get_network_ip() {
 update_api_config() {
     local current_ip=$(get_network_ip)
     local api_config_file="../lib/app/config/api_config.dart"
+    local env_file=".env"
+    local target_port=${PORT:-8000}
     
     if [ -z "$current_ip" ]; then
-        echo "Warning: Could not detect network IP address. Skipping api_config.dart update."
+        echo "Warning: Could not detect network IP address. Skipping IP updates."
         return
     fi
     
-    if [ ! -f "$api_config_file" ]; then
-        echo "Warning: api_config.dart not found at $api_config_file. Skipping update."
-        return
-    fi
-    
-    # Use sed to replace the IP address in the return statement
-    # Pattern: replace IP address in 'http://XXX.XXX.XXX.XXX:8000'
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        # macOS uses BSD sed, requires different syntax
-        sed -i '' "s|return 'http://[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}:8000'|return 'http://${current_ip}:8000'|g" "$api_config_file"
+    if [ -f "$api_config_file" ]; then
+        # Use sed to replace the IP address and port in the return statement
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            # macOS uses BSD sed, requires different syntax
+            sed -i '' "s|return 'http://[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}:[0-9]*'|return 'http://${current_ip}:${target_port}'|g" "$api_config_file"
+        else
+            # Linux uses GNU sed
+            sed -i "s|return 'http://[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}:[0-9]*'|return 'http://${current_ip}:${target_port}'|g" "$api_config_file"
+        fi
+        
+        echo "Updated api_config.dart with IP address: $current_ip and port: $target_port"
     else
-        # Linux uses GNU sed
-        sed -i "s|return 'http://[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}:8000'|return 'http://${current_ip}:8000'|g" "$api_config_file"
+        echo "Warning: api_config.dart not found at $api_config_file. Skipping update."
     fi
-    
-    echo "Updated api_config.dart with IP address: $current_ip"
+
+    if [ -f "$env_file" ]; then
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            sed -i '' "s|^PUBLIC_SERVER_URL=.*|PUBLIC_SERVER_URL=http://${current_ip}:${target_port}|g" "$env_file"
+        else
+            sed -i "s|^PUBLIC_SERVER_URL=.*|PUBLIC_SERVER_URL=http://${current_ip}:${target_port}|g" "$env_file"
+        fi
+        echo "Updated .env PUBLIC_SERVER_URL with IP address: $current_ip and port: $target_port"
+    else
+        echo "Warning: .env not found at $env_file. Skipping update."
+    fi
 }
+
+# Load .env variables first so command-line flags or script defaults can use them
+if [ -f ".env" ]; then
+    export $(grep -v '^#' .env | xargs)
+fi
 
 # Update the API config before starting the server
 update_api_config
@@ -94,10 +110,7 @@ if ! command -v "$UVICORN_CMD" &> /dev/null && [ ! -f "$UVICORN_CMD" ]; then
     exit 1
 fi
 
-# Load .env variables first so command-line flags can override them
-if [ -f ".env" ]; then
-    export $(grep -v '^#' .env | xargs)
-fi
+
 
 # Parse arguments
 USE_TEST_DB="false"

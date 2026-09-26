@@ -159,13 +159,13 @@ async def on_player_disconnect(room_id: str, player_id: str, websocket=None, con
                 "player_id": player_id,
             })
 
-        # Remove player from room if they stay offline while in WAITING state
-        if room and room.status == RoomStatus.WAITING:
+        # Remove player from room if they stay offline while in WAITING or FINISHED state
+        if room and room.status in (RoomStatus.WAITING, RoomStatus.FINISHED):
             async def _delayed_remove(r_id, p_id):
-                await asyncio.sleep(15)  # Wait 15 seconds for reconnect
+                await asyncio.sleep(30)  # Wait 30 seconds for reconnect
                 async with get_room_lock(r_id):
                     current_r = await room_service.get_room(r_id)
-                    if not current_r or current_r.status != RoomStatus.WAITING:
+                    if not current_r or current_r.status not in (RoomStatus.WAITING, RoomStatus.FINISHED):
                         return
                     p = next((x for x in current_r.players + current_r.waiting_players if x.player_id == p_id), None)
                     if p and not p.is_connected:

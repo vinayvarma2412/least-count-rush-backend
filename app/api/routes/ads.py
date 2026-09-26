@@ -31,6 +31,7 @@ class AdsStatusResponse(BaseModel):
     ads_free: bool
     ads_free_until: Optional[datetime]
     today_counts: dict[str, int]
+    online_games_played: int = 0
 
 
 class RecordImpressionRequest(BaseModel):
@@ -70,10 +71,12 @@ async def get_ads_status(
     """
     free = await ads_service.is_ads_free(current_user.user_idn, db)
     counts = await ads_service.get_today_counts(current_user.user_idn, db)
+    online_games_played = await ads_service.get_online_games_played(current_user.user_idn, db)
     return AdsStatusResponse(
         ads_free=free,
         ads_free_until=current_user.ads_free_until,
         today_counts=counts,
+        online_games_played=online_games_played,
     )
 
 

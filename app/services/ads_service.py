@@ -8,7 +8,7 @@ from typing import Optional
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.db_models import AdImpression, AdPlacementEnum, User
+from app.models.db_models import AdImpression, AdPlacementEnum, User, UserLeaderboardStat
 
 
 async def is_ads_free(user_idn: int, db: AsyncSession) -> bool:
@@ -41,6 +41,15 @@ async def get_today_counts(user_idn: int, db: AsyncSession) -> dict[str, int]:
     for row in rows:
         counts[row.placement.value] = row.impression_count
     return counts
+
+
+async def get_online_games_played(user_idn: int, db: AsyncSession) -> int:
+    """
+    Returns the total number of online games played by the user.
+    """
+    stat = await db.get(UserLeaderboardStat, user_idn)
+    return stat.games_played if stat else 0
+
 
 
 async def record_impression(
