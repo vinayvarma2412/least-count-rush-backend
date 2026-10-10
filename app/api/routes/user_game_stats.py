@@ -1,6 +1,7 @@
+from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import List, Dict, Any
+from typing import Optional, List, Dict, Any
 from app.database import get_db_session
 from app.api.dependencies import get_current_db_user
 from app.services.pg_game_stats_service import pg_game_stats_service
@@ -32,8 +33,8 @@ async def save_game_stats(
 async def get_game_stats(
     limit: int = 10,
     offset: int = 0,
-    game_type: GameTypeEnum | None = None,
-    year: int | None = None,
+    game_type: Optional[GameTypeEnum] = None,
+    year: Optional[int] = None,
     user: User = Depends(get_current_db_user),
     db: AsyncSession = Depends(get_db_session)
 ):
@@ -46,8 +47,8 @@ async def get_game_stats(
 
 @router.get("/summary")
 async def get_game_stats_summary(
-    game_type: GameTypeEnum | None = None,
-    year: int | None = None,
+    game_type: Optional[GameTypeEnum] = None,
+    year: Optional[int] = None,
     user: User = Depends(get_current_db_user),
     db: AsyncSession = Depends(get_db_session)
 ):
@@ -59,8 +60,8 @@ async def get_game_stats_summary(
 
 @router.get("/achievements")
 async def get_achievements(
-    game_type: GameTypeEnum | None = None,
-    year: int | None = None,
+    game_type: Optional[GameTypeEnum] = None,
+    year: Optional[int] = None,
     user: User = Depends(get_current_db_user),
     db: AsyncSession = Depends(get_db_session)
 ):

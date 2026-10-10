@@ -1,8 +1,9 @@
 """
 WebSocket handlers for game events
 """
+from __future__ import annotations
 from fastapi import WebSocket
-from typing import Dict
+from typing import Optional, Dict
 from app.api.websocket.connection_manager import manager
 from app.utils.lock import with_room_lock
 from app.services.game_service import game_service
@@ -22,7 +23,7 @@ _online_game_ids: dict[str, int] = {}        # room_id -> game_idn
 _online_game_started_at: dict[str, object] = {}  # room_id -> datetime
 
 
-async def start_game_for_room(room_id: str, eliminated_indices: list[int] | None = None, initial_turn_override: int | None = None) -> bool:
+async def start_game_for_room(room_id: str, eliminated_indices: Optional[list[int]] = None, initial_turn_override: Optional[int] = None) -> bool:
     """
     Start game for a room if all conditions are met.
     Returns True if game was started, False otherwise.
@@ -151,7 +152,7 @@ async def start_game_for_room(room_id: str, eliminated_indices: list[int] | None
                 for idx, p in enumerate(updated_room.players)
             ]
 
-            creator_idn: int | None = None
+            creator_idn: Optional[int] = None
             for p in updated_room.players:
                 if getattr(p, "is_admin", False):
                     creator_idn = uid_to_idn.get(p.player_id)

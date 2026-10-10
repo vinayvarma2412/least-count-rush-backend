@@ -1,3 +1,4 @@
+from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
@@ -15,15 +16,15 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/users", tags=["users"])
 
 class ProfileUpdateRequest(BaseModel):
-    display_name: str | None = None
-    avatar_seed: str | None = None
+    display_name: Optional[str] = None
+    avatar_seed: Optional[str] = None
 
 class SyncUserRequest(BaseModel):
     user_type: str = "authenticated"
 
 @router.post("/sync", status_code=status.HTTP_200_OK)
 async def sync_user(
-    req: SyncUserRequest | None = None,
+    req: Optional[SyncUserRequest] = None,
     firebase_user: dict = Depends(get_current_firebase_user),
     db: AsyncSession = Depends(get_db_session)
 ):
