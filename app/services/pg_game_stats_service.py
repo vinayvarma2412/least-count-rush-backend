@@ -1,3 +1,5 @@
+from __future__ import annotations
+from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import delete
@@ -132,7 +134,7 @@ class PgGameStatsService:
     async def _get_bot_name_map(self, db: AsyncSession) -> dict[str, int]:
         pass  # Replaced by BOT_NAME_TO_USER_IDN constant above
 
-    async def get_game_stats_for_user(self, db: AsyncSession, user_idn: int, limit: int = 10, offset: int = 0, game_type: GameTypeEnum | None = None, year: int | None = None) -> list[dict]:
+    async def get_game_stats_for_user(self, db: AsyncSession, user_idn: int, limit: int = 10, offset: int = 0, game_type: Optional[GameTypeEnum] = None, year: Optional[int] = None) -> list[dict]:
         """
         Retrieves paginated game stats for a user and maps them back to the format
         expected by the Flutter client.
@@ -193,7 +195,7 @@ class PgGameStatsService:
             
         return stats_list
 
-    async def get_game_stats_summary_for_user(self, db: AsyncSession, user_idn: int, game_type: GameTypeEnum | None = None, year: int | None = None) -> dict:
+    async def get_game_stats_summary_for_user(self, db: AsyncSession, user_idn: int, game_type: Optional[GameTypeEnum] = None, year: Optional[int] = None) -> dict:
         """
         Calculates summary statistics for a user from Postgres.
         """
@@ -251,7 +253,7 @@ class PgGameStatsService:
             global_log.error("pg_delete_game_stats_error", {"error": str(e)})
             return False
 
-    async def get_achievements_for_user(self, db: AsyncSession, user_idn: int, game_type: GameTypeEnum | None = None, year: int | None = None) -> dict[str, int]:
+    async def get_achievements_for_user(self, db: AsyncSession, user_idn: int, game_type: Optional[GameTypeEnum] = None, year: Optional[int] = None) -> dict[str, int]:
         """
         Calculates achievement progress counters from Postgres.
         Returns a dict mapping achievement_type (str) to current_progress (int).

@@ -4,6 +4,7 @@ Game service for managing game state and logic — Redis-backed.
 Key schema:
   game:{room_id}  → JSON blob of GameState.dict()  (TTL 4 h)
 """
+from __future__ import annotations
 import copy
 import json
 import random
@@ -66,8 +67,8 @@ class GameService:
     async def initialize_game(
         self,
         room_id: str,
-        eliminated_indices: list[int] | None = None,
-        initial_turn_override: int | None = None,
+        eliminated_indices: Optional[list[int]] = None,
+        initial_turn_override: Optional[int] = None,
     ) -> Optional[GameState]:
         """Initialize a new game for a room."""
         log = get_room_logger(room_id)
