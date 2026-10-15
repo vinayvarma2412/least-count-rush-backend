@@ -5,7 +5,7 @@ from sqlalchemy.future import select
 from sqlalchemy import delete
 from sqlalchemy.orm import joinedload
 from app.models.db_models import Game, GamePlayer, GameTypeEnum, GameModeEnum, GameResultEnum
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # Hardcoded bot user_idn mapping — matches the seeded bot rows (user_idn 1–5)
 # and the botNames list in opponent.dart.
@@ -25,6 +25,11 @@ class PgGameStatsService:
         """
         try:
             for stat in stats_list:
+                status_str = stat.get("status", "completed")
+                if status_str == "in_progress":
+                    # In-progress offline games should never be persisted to the backend
+                    continue
+
                 # Map Flutter fields to PostgreSQL fields
                 game_mode_str = stat.get("gameMode", "Single Game")
                 if "Tournament" in game_mode_str:
@@ -59,22 +64,34 @@ class PgGameStatsService:
                 elif winner_name and winner_name in bot_name_map:
                     winner_user_idn = bot_name_map[winner_name]
 
-
                 # Map status to GameResultEnum
-                status_str = stat.get("status", "completed")
-                game_result = GameResultEnum.completed
                 if status_str == "cancelled":
                     game_result = GameResultEnum.cancelled
+                else:
+                    game_result = GameResultEnum.completed
 
-                client_game_id = stat.get("id")
+                raw_client_game_id = stat.get("id")
+                client_game_id = str(raw_client_game_id).strip() if raw_client_game_id is not None and str(raw_client_game_id).strip() else None
 
                 # Check if game already exists for idempotency
                 existing_game = None
                 if client_game_id:
                     result = await db.execute(
-                        select(Game).where(Game.created_user_idn == user_idn, Game.client_game_id == str(client_game_id))
+                        select(Game).where(Game.created_user_idn == user_idn, Game.client_game_id == client_game_id)
                     )
                     existing_game = result.scalar_one_or_none()
+
+                if not existing_game and not client_game_id:
+                    # Fallback deduplication: check if near-duplicate exists by user + mode + timestamp window
+                    result = await db.execute(
+                        select(Game).where(
+                            Game.created_user_idn == user_idn,
+                            Game.game_mode == game_mode,
+                            Game.game_type == GameTypeEnum.offline,
+                            Game.started_at.between(started_at - timedelta(seconds=10), started_at + timedelta(seconds=10))
+                        )
+                    )
+                    existing_game = result.scalars().first()
 
                 if existing_game:
                     # Update existing game
@@ -82,6 +99,8 @@ class PgGameStatsService:
                     existing_game.total_rounds = stat.get("roundsPlayed", 0)
                     existing_game.winner_user_idn = winner_user_idn
                     existing_game.duration_seconds = stat.get("durationSeconds")
+                    if client_game_id and not existing_game.client_game_id:
+                        existing_game.client_game_id = client_game_id
                     
                     # Update game player
                     result = await db.execute(
@@ -107,7 +126,7 @@ class PgGameStatsService:
                     ended_at=started_at,  # Approximate
                     duration_seconds=stat.get("durationSeconds"),
                     score_limit=stat.get("scoreLimit", ""),
-                    client_game_id=str(client_game_id) if client_game_id else None
+                    client_game_id=client_game_id
                 )
                 db.add(game)
                 await db.flush()  # To get game.game_idn
@@ -143,7 +162,7 @@ class PgGameStatsService:
         query = (
             select(Game, GamePlayer)
             .join(GamePlayer, Game.game_idn == GamePlayer.game_idn)
-            .where(GamePlayer.user_idn == user_idn)
+            .where(GamePlayer.user_idn == user_idn, Game.result != GameResultEnum.in_progress)
         )
         
         if game_type:
@@ -201,8 +220,12 @@ class PgGameStatsService:
         """
         from sqlalchemy import func, extract
         
-        # Base query to get games user played
-        base_query = select(Game, GamePlayer).join(GamePlayer, Game.game_idn == GamePlayer.game_idn).where(GamePlayer.user_idn == user_idn)
+        # Base query to get games user played (excluding active in_progress games)
+        base_query = (
+            select(Game, GamePlayer)
+            .join(GamePlayer, Game.game_idn == GamePlayer.game_idn)
+            .where(GamePlayer.user_idn == user_idn, Game.result != GameResultEnum.in_progress)
+        )
         if game_type:
             base_query = base_query.where(Game.game_type == game_type)
         if year:
