@@ -70,9 +70,26 @@ update_api_config() {
     fi
 }
 
-# Load .env variables first so command-line flags or script defaults can use them
+# Load only simple script-needed keys. Do NOT `export $(xargs)` the whole
+# file — PEM keys and JSON credentials contain spaces/newlines and get split
+# into invalid `export` identifiers. pydantic/dotenv still reads .env for IAP.
 if [ -f ".env" ]; then
-    export $(grep -v '^#' .env | xargs)
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ''|\#*) continue ;;
+        esac
+        key="${line%%=*}"
+        case "$key" in
+            PORT|LOG_LEVEL|REDIS_URL|DATABASE_URL|PUBLIC_SERVER_URL)
+                value="${line#*=}"
+                value="${value%$'\r'}"
+                if [[ "$value" == \"*\" ]]; then
+                    value="${value:1:${#value}-2}"
+                fi
+                export "$key=$value"
+                ;;
+        esac
+    done < ".env"
 fi
 
 # Update the API config before starting the server

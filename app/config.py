@@ -19,7 +19,16 @@ class Settings(BaseSettings):
     admob_client_id: str = ""
     admob_client_secret: str = ""
     admob_refresh_token: str = ""
-    
+    iap_google_package_name: str = "com.mrunknown.least_count_game"
+    iap_google_service_account_json: str = ""
+    iap_google_service_account_file: str = ""
+    iap_apple_bundle_id: str = "com.mrunknown.leastCountGame"
+    iap_apple_issuer_id: str = ""
+    iap_apple_key_id: str = ""
+    iap_apple_private_key: str = ""
+    iap_apple_private_key_file: str = ""
+    iap_apple_shared_secret: str = ""
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
 

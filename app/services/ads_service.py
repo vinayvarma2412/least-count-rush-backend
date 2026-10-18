@@ -21,7 +21,10 @@ async def is_ads_free(user_idn: int, db: AsyncSession) -> bool:
         return False
     if user.ads_free_until is None:
         return True  # permanent grant
-    return datetime.now(timezone.utc) < user.ads_free_until
+    until = user.ads_free_until
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) < until
 
 
 async def get_today_counts(user_idn: int, db: AsyncSession) -> dict[str, int]:

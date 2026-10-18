@@ -52,6 +52,23 @@ class AdPlacementEnum(str, enum.Enum):
     play_with_randoms_rewarded = "play_with_randoms_rewarded"
     play_with_bot_rewarded_interstitial = "play_with_bot_rewarded_interstitial"
 
+class IapPlatformEnum(str, enum.Enum):
+    android = "android"
+    ios = "ios"
+
+class IapVerificationStatusEnum(str, enum.Enum):
+    pending = "pending"
+    verified = "verified"
+    rejected = "rejected"
+    expired = "expired"
+    refunded = "refunded"
+
+class IapSourceEnum(str, enum.Enum):
+    purchase = "purchase"
+    restore = "restore"
+    renew = "renew"
+    verify = "verify"
+
 # --- Models ---
 
 class User(Base):
@@ -82,6 +99,7 @@ class User(Base):
     games_created = relationship("Game", back_populates="creator", foreign_keys="Game.created_user_idn")
     games_won = relationship("Game", back_populates="winner", foreign_keys="Game.winner_user_idn")
     game_participations = relationship("GamePlayer", back_populates="user", cascade="all, delete-orphan")
+    iap_transactions = relationship("IapTransaction", back_populates="user", cascade="all, delete-orphan")
 
 
 class UserDevice(Base):
@@ -291,6 +309,45 @@ class AdImpression(Base):
     )
 
     user = relationship("User")
+
+class IapTransaction(Base):
+    """One row per store transaction (purchase, restore, renewal, or rejected attempt)."""
+    __tablename__ = "iap_transactions"
+
+    iap_transaction_idn = Column(Integer, primary_key=True, index=True)
+    user_idn = Column(Integer, ForeignKey("users.user_idn", ondelete="CASCADE"), nullable=False, index=True)
+    platform = Column(String, nullable=False)
+    product_id = Column(String, nullable=False)
+    plan_id = Column(String, nullable=True)
+    purchase_token = Column(String, nullable=False, index=True)
+    store_transaction_id = Column(String, nullable=False)
+    original_transaction_id = Column(String, nullable=True, index=True)
+    verification_status = Column(String, nullable=False, default="pending")
+    source = Column(String, nullable=False, default="purchase")
+    environment = Column(String, nullable=True)
+    purchase_dt = Column(DateTime(timezone=True), nullable=True)
+    expires_dt = Column(DateTime(timezone=True), nullable=True)
+    acknowledged = Column(Boolean, nullable=False, default=False)
+    error_message = Column(String, nullable=True)
+    store_payload = Column(JSON, nullable=True)
+    crt_dt = Column(DateTime(timezone=True), server_default=func.now())
+    upd_dt = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("platform", "store_transaction_id", name="uq_iap_platform_store_txn"),
+        CheckConstraint("platform IN ('android', 'ios')", name="ck_iap_platform"),
+        CheckConstraint(
+            "verification_status IN ('pending', 'verified', 'rejected', 'expired', 'refunded')",
+            name="ck_iap_verification_status",
+        ),
+        CheckConstraint(
+            "source IN ('purchase', 'restore', 'renew', 'verify')",
+            name="ck_iap_source",
+        ),
+    )
+
+    user = relationship("User", back_populates="iap_transactions")
+
 
 class DeletedUser(Base):
     __tablename__ = "deleted_users"

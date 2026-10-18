@@ -8,7 +8,7 @@ from fastapi import FastAPI, WebSocket
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.routes import rooms, deck, games, users, user_game_stats, leaderboard, messages, admin, notifications, ads, rate_us
+from app.api.routes import rooms, deck, games, users, user_game_stats, leaderboard, messages, admin, notifications, ads, rate_us, iap
 from app.api.websocket import room_ws, presence_ws
 from app.utils.room_logger import setup_logging, global_log
 from app.services.room_service import room_service
@@ -93,6 +93,8 @@ app.include_router(admin.firebase_router)  # Firebase-auth protected admin route
 app.include_router(notifications.router)
 app.include_router(ads.router)
 app.include_router(ads.admin_router)
+app.include_router(iap.router)
+app.include_router(iap.admin_router)
 app.include_router(rate_us.router)
 
 # WebSocket endpoints
