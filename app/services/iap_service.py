@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import or_, select
@@ -17,6 +17,8 @@ from app.services.iap_store_clients import DefaultStoreVerifier, StoreVerificati
 logger = logging.getLogger(__name__)
 
 _store_verifier: StoreVerifier = DefaultStoreVerifier()
+_REFRESH_MIN_INTERVAL = timedelta(hours=6)
+_REFRESH_IF_WITHIN = timedelta(hours=36)
 
 
 def set_store_verifier(verifier: StoreVerifier) -> None:
@@ -289,6 +291,70 @@ async def verify_and_record(
         "expires_dt": store.expires_dt,
         "store_transaction_id": store.store_transaction_id,
     }
+
+
+def _as_utc(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+async def latest_verified_transaction(db: AsyncSession, user_idn: int) -> Optional[IapTransaction]:
+    result = await db.execute(
+        select(IapTransaction)
+        .where(
+            IapTransaction.user_idn == user_idn,
+            IapTransaction.verification_status == "verified",
+        )
+        .order_by(IapTransaction.expires_dt.desc(), IapTransaction.upd_dt.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+def _should_refresh_from_store(user: User, txn: IapTransaction, now: datetime) -> bool:
+    until = _as_utc(user.ads_free_until)
+    if until is None or until <= now:
+        return True
+    if until <= now + _REFRESH_IF_WITHIN:
+        return True
+    checked = _as_utc(txn.upd_dt) or _as_utc(txn.crt_dt)
+    if checked is None:
+        return True
+    return (now - checked) >= _REFRESH_MIN_INTERVAL
+
+
+async def refresh_entitlement_from_store(db: AsyncSession, user: User) -> User:
+    """Re-query Google/Apple with the saved token so renewals extend ads_free_until."""
+    txn = await latest_verified_transaction(db, user.user_idn)
+    if txn is None or not txn.purchase_token:
+        return user
+    now = datetime.now(timezone.utc)
+    if not _should_refresh_from_store(user, txn, now):
+        return user
+    purchase_id = txn.original_transaction_id or txn.store_transaction_id
+    try:
+        await verify_and_record(
+            db,
+            user,
+            platform=txn.platform,
+            product_id=txn.product_id,
+            plan_id_hint=txn.plan_id,
+            purchase_id=purchase_id,
+            verification_data=txn.purchase_token,
+            source="renew",
+        )
+    except IapVerificationError as e:
+        logger.warning(
+            "Entitlement store refresh failed user=%s platform=%s: %s",
+            user.user_idn,
+            txn.platform,
+            e.message,
+        )
+    await db.refresh(user)
+    return user
 
 
 async def list_user_transactions(db: AsyncSession, user_idn: int, limit: int = 50) -> list[IapTransaction]:

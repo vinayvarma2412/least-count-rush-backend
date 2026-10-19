@@ -246,6 +246,40 @@ async def test_unknown_product_rejected_without_store_call(async_db):
     assert called.n == 0
 
 
+def test_canonicalize_plan_id_aliases():
+    from app.services.iap_catalog import canonicalize_plan_id
+
+    assert canonicalize_plan_id("quarterly") == "quarterly"
+    assert canonicalize_plan_id("3months") == "quarterly"
+    assert canonicalize_plan_id("ad_free_6months") == "halfyearly"
+    assert canonicalize_plan_id("p1y") == "yearly"
+
+
+def test_pick_google_line_item_uses_latest_expiry():
+    from datetime import datetime, timezone
+    from app.services.iap_store_clients import pick_google_line_item
+
+    older = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+    newer = int(datetime(2026, 7, 1, tzinfo=timezone.utc).timestamp() * 1000)
+    item = pick_google_line_item(
+        {
+            "lineItems": [
+                {
+                    "productId": "ad_free_monthly",
+                    "expiryTime": str(older),
+                    "offerDetails": {"basePlanId": "quarterly"},
+                },
+                {
+                    "productId": "ad_free_monthly",
+                    "expiryTime": str(newer),
+                    "offerDetails": {"basePlanId": "halfyearly"},
+                },
+            ]
+        }
+    )
+    assert item["offerDetails"]["basePlanId"] == "halfyearly"
+
+
 def test_extract_google_purchase_token_from_json_and_raw():
     from app.services.iap_store_clients import extract_google_purchase_token
 
@@ -298,3 +332,79 @@ async def test_store_crash_becomes_verification_error(async_db):
             verification_data="token",
             source="purchase",
         )
+
+
+@pytest.mark.asyncio
+async def test_refresh_entitlement_extends_expiry_after_renewal(async_db):
+    now = datetime.now(timezone.utc)
+    iap_service.set_store_verifier(FakeStore(_active_android(expires_in_days=30)))
+    user = await _user(async_db)
+    await iap_service.verify_and_record(
+        async_db,
+        user,
+        platform="android",
+        product_id="ad_free_monthly",
+        plan_id_hint="yearly",
+        purchase_id="GPA.1234-5678",
+        verification_data="gp-token-1",
+        source="purchase",
+    )
+    user = await _user(async_db)
+    user.ads_free_until = now - timedelta(days=1)
+    await async_db.commit()
+
+    renewed = now + timedelta(days=30)
+    iap_service.set_store_verifier(
+        FakeStore(
+            StoreVerificationResult(
+                ok=True,
+                product_id="ad_free_monthly",
+                plan_id="yearly",
+                purchase_token="gp-token-1",
+                store_transaction_id="GPA.1234-5678..1",
+                original_transaction_id="GPA.1234-5678",
+                purchase_dt=now,
+                expires_dt=renewed,
+                is_active=True,
+                environment="IN",
+                acknowledged=True,
+                raw={"subscriptionState": "SUBSCRIPTION_STATE_ACTIVE"},
+            )
+        )
+    )
+    user = await _user(async_db)
+    await iap_service.refresh_entitlement_from_store(async_db, user)
+    user = await _user(async_db)
+    assert user.ads_free is True
+    until = user.ads_free_until
+    assert until is not None
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=timezone.utc)
+    assert until > now
+
+
+@pytest.mark.asyncio
+async def test_refresh_entitlement_skips_store_when_still_valid(async_db):
+    called = SimpleNamespace(n=0)
+
+    class Guard(FakeStore):
+        async def verify_android(self, purchase_token, product_id):
+            called.n += 1
+            return self.result
+
+    iap_service.set_store_verifier(Guard(_active_android(expires_in_days=200)))
+    user = await _user(async_db)
+    await iap_service.verify_and_record(
+        async_db,
+        user,
+        platform="android",
+        product_id="ad_free_monthly",
+        plan_id_hint="yearly",
+        purchase_id="GPA.1234-5678",
+        verification_data="gp-token-1",
+        source="purchase",
+    )
+    assert called.n == 1
+    user = await _user(async_db)
+    await iap_service.refresh_entitlement_from_store(async_db, user)
+    assert called.n == 1

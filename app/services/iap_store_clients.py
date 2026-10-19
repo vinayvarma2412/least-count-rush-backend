@@ -15,6 +15,7 @@ import jwt
 
 from app.config import settings
 from app.services.iap_catalog import (
+    ANDROID_PRODUCT_ID,
     GOOGLE_ACTIVE_STATES,
     plan_id_for_product,
 )
@@ -41,6 +42,19 @@ def _ms_to_dt(value: Any) -> Optional[datetime]:
         return datetime.fromtimestamp(millis, tz=timezone.utc)
     except (TypeError, ValueError, OSError):
         return None
+
+
+def pick_google_line_item(payload: dict) -> dict:
+    """Prefer the line item that expires last — that is the current period."""
+    items = payload.get("lineItems") or []
+    if not items:
+        return {}
+    ranked = []
+    for item in items:
+        expiry = _ms_to_dt(item.get("expiryTime"))
+        ranked.append((expiry or datetime.min.replace(tzinfo=timezone.utc), item))
+    ranked.sort(key=lambda pair: pair[0], reverse=True)
+    return ranked[0][1]
 
 
 def extract_google_purchase_token(raw: str) -> str:
@@ -251,9 +265,13 @@ class GooglePlayVerifier:
     def _result_from_v2(
         self, payload: dict, purchase_token: str, product_id: str
     ) -> StoreVerificationResult:
-        line_items = payload.get("lineItems") or []
-        item = line_items[0] if line_items else {}
-        store_product = item.get("productId") or product_id
+        item = pick_google_line_item(payload)
+        line_product = item.get("productId") or product_id
+        store_product = (
+            product_id
+            if product_id == ANDROID_PRODUCT_ID
+            else line_product
+        )
         offer = item.get("offerDetails") or {}
         base_plan = offer.get("basePlanId")
         state = payload.get("subscriptionState")
@@ -368,10 +386,25 @@ class AppleStoreVerifier:
         purchase_id: Optional[str] = None,
     ) -> StoreVerificationResult:
         transaction_id = purchase_id
-        if verification_data.count(".") == 2:
-            claims = decode_jws_payload_unverified(verification_data)
+        original_id = purchase_id
+        token = (verification_data or "").strip()
+        if token.count(".") == 2:
+            claims = decode_jws_payload_unverified(token)
             transaction_id = transaction_id or claims.get("transactionId")
+            original_id = (
+                claims.get("originalTransactionId") or original_id or transaction_id
+            )
+        elif token:
+            original_id = original_id or token
+            transaction_id = transaction_id or token
         lookup_error = "Could not determine Apple transaction id"
+        if original_id and self._app_store_jwt():
+            result = await self._get_subscription_status(str(original_id))
+            if result.ok:
+                return result
+            lookup_error = result.error or lookup_error
+            if result.error and "not configured" in result.error:
+                return result
         if transaction_id and self._app_store_jwt():
             result = await self._get_transaction_info(str(transaction_id))
             if result.ok:
@@ -387,6 +420,41 @@ class AppleStoreVerifier:
                 error="App Store API credentials are not configured",
             )
         return StoreVerificationResult(ok=False, error=lookup_error)
+
+    async def _get_subscription_status(self, original_transaction_id: str) -> StoreVerificationResult:
+        """Current subscription period, including auto-renewals, for an original txn id."""
+        token = self._app_store_jwt()
+        if not token:
+            return StoreVerificationResult(ok=False, error="App Store API credentials are not configured")
+        headers = {"Authorization": f"Bearer {token}"}
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            for base, env_name in ((APPLE_PROD, "Production"), (APPLE_SANDBOX, "Sandbox")):
+                url = f"{base}/inApps/v1/subscriptions/{original_transaction_id}"
+                try:
+                    resp = await client.get(url, headers=headers)
+                except httpx.HTTPError as e:
+                    logger.warning("Apple subscription status failed: %s", e)
+                    continue
+                if resp.status_code == 404:
+                    continue
+                if resp.status_code >= 400:
+                    logger.warning(
+                        "Apple subscription status %s: %s",
+                        resp.status_code,
+                        resp.text[:300],
+                    )
+                    continue
+                body = resp.json()
+                for group in body.get("data") or []:
+                    for last in group.get("lastTransactions") or []:
+                        signed = last.get("signedTransactionInfo") or ""
+                        claims = decode_jws_payload_unverified(signed)
+                        if claims:
+                            return self._result_from_apple_claims(claims, env_name, body)
+        return StoreVerificationResult(
+            ok=False,
+            error="Apple could not find this subscription",
+        )
 
     async def _get_transaction_info(self, transaction_id: str) -> StoreVerificationResult:
         token = self._app_store_jwt()

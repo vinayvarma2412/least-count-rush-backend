@@ -16,7 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db_session
 from app.api.dependencies import get_current_db_user, get_admin_api_key
 from app.models.db_models import AdPlacementEnum, User
-from app.services import ads_service
+from app.services import ads_service, iap_service
+from app.services.iap_catalog import canonicalize_plan_id
 
 import logging
 
@@ -30,6 +31,8 @@ router = APIRouter(prefix="/api/ads", tags=["Ads"])
 class AdsStatusResponse(BaseModel):
     ads_free: bool
     ads_free_until: Optional[datetime]
+    plan_id: Optional[str] = None
+    platform: Optional[str] = None
     today_counts: dict[str, int]
     online_games_played: int = 0
 
@@ -66,15 +69,19 @@ async def get_ads_status(
 ):
     """
     Returns the user's ad-free status and today's impression counts per placement.
-    The Flutter client compares today_counts vs daily_cap from Firebase Remote Config
-    to decide whether to show an ad.
+    Re-checks the store when a saved purchase token exists so auto-renewals
+    extend ads_free_until without requiring Restore.
     """
+    current_user = await iap_service.refresh_entitlement_from_store(db, current_user)
     free = await ads_service.is_ads_free(current_user.user_idn, db)
     counts = await ads_service.get_today_counts(current_user.user_idn, db)
     online_games_played = await ads_service.get_online_games_played(current_user.user_idn, db)
+    txn = await iap_service.latest_verified_transaction(db, current_user.user_idn)
     return AdsStatusResponse(
         ads_free=free,
         ads_free_until=current_user.ads_free_until,
+        plan_id=canonicalize_plan_id(txn.plan_id) if txn else None,
+        platform=txn.platform if txn else None,
         today_counts=counts,
         online_games_played=online_games_played,
     )
