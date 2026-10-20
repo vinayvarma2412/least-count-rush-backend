@@ -10,8 +10,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.db_models import IapTransaction, User
-from app.services import ads_service
-from app.services.iap_catalog import PLAN_DURATION, is_allowed_product, plan_id_for_product
+from app.services.iap_catalog import is_allowed_product, plan_id_for_product
 from app.services.iap_store_clients import DefaultStoreVerifier, StoreVerificationResult, StoreVerifier
 
 logger = logging.getLogger(__name__)
@@ -159,29 +158,6 @@ async def _record_transaction(
     return row, False
 
 
-async def _apply_entitlement(
-    db: AsyncSession,
-    user: User,
-    store: StoreVerificationResult,
-) -> User:
-    now = datetime.now(timezone.utc)
-    expires = store.expires_dt
-    if expires is None and store.plan_id and store.plan_id in PLAN_DURATION:
-        expires = now + PLAN_DURATION[store.plan_id]
-    if not store.is_active or expires is None or expires <= now:
-        return user
-    if user.ads_free and user.ads_free_until is None:
-        return user
-    until = expires
-    existing = user.ads_free_until
-    if existing is not None:
-        if existing.tzinfo is None:
-            existing = existing.replace(tzinfo=timezone.utc)
-        if existing > until:
-            until = existing
-    return await ads_service.grant_ads_free(user.user_idn, db, until=until)
-
-
 async def verify_and_record(
     db: AsyncSession,
     user: User,
@@ -269,22 +245,18 @@ async def verify_and_record(
         store_payload=_sanitize_payload(store.raw),
     )
 
-    if store.is_active:
-        await db.refresh(user)
-        await _apply_entitlement(db, user, store)
-        await db.refresh(user)
-        if platform == "android" and not store.acknowledged:
-            ack = await _store_verifier.acknowledge_android(store.product_id, store.purchase_token)
-            if ack:
-                txn.acknowledged = True
+    if store.is_active and platform == "android" and not store.acknowledged:
+        ack = await _store_verifier.acknowledge_android(store.product_id, store.purchase_token)
+        if ack:
+            txn.acknowledged = True
 
-    ads_free = await ads_service.is_ads_free(user.user_idn, db)
-    await db.refresh(user)
+    await db.commit()
+    iap_free, iap_until = iap_entitlement_from_txn(txn)
     return {
         "verified": store.ok and store.is_active,
         "already_recorded": already,
-        "ads_free": ads_free,
-        "ads_free_until": user.ads_free_until,
+        "ads_free": iap_free,
+        "ads_free_until": iap_until,
         "product_id": store.product_id,
         "plan_id": plan_id,
         "transaction_idn": txn.iap_transaction_idn,
@@ -314,8 +286,23 @@ async def latest_verified_transaction(db: AsyncSession, user_idn: int) -> Option
     return result.scalar_one_or_none()
 
 
+def iap_entitlement_from_txn(
+    txn: Optional[IapTransaction],
+    now: Optional[datetime] = None,
+) -> tuple[bool, Optional[datetime]]:
+    if txn is None or txn.verification_status != "verified":
+        return False, None
+    until = _as_utc(txn.expires_dt)
+    if until is None:
+        return True, None
+    current = now or datetime.now(timezone.utc)
+    if until <= current:
+        return False, until
+    return True, until
+
+
 def _should_refresh_from_store(user: User, txn: IapTransaction, now: datetime) -> bool:
-    until = _as_utc(user.ads_free_until)
+    until = _as_utc(txn.expires_dt)
     if until is None or until <= now:
         return True
     if until <= now + _REFRESH_IF_WITHIN:
@@ -327,7 +314,7 @@ def _should_refresh_from_store(user: User, txn: IapTransaction, now: datetime) -
 
 
 async def refresh_entitlement_from_store(db: AsyncSession, user: User) -> User:
-    """Re-query Google/Apple with the saved token so renewals extend ads_free_until."""
+    """Re-query Google/Apple with the saved token so renewals update iap_transactions."""
     txn = await latest_verified_transaction(db, user.user_idn)
     if txn is None or not txn.purchase_token:
         return user

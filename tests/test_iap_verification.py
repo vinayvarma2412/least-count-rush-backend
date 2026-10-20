@@ -111,8 +111,30 @@ async def test_verified_purchase_grants_ads_free_and_records_row(async_db):
     assert rows[0].verification_status == "verified"
     assert rows[0].store_transaction_id == "GPA.1234-5678"
     refreshed = await _user(async_db)
+    assert refreshed.ads_free is False
+    assert refreshed.ads_free_until is None
+
+
+@pytest.mark.asyncio
+async def test_subscribe_does_not_overwrite_manual_ads_free(async_db):
+    iap_service.set_store_verifier(FakeStore(_active_android()))
+    user = await _user(async_db)
+    user.ads_free = True
+    user.ads_free_until = None
+    await async_db.commit()
+    await iap_service.verify_and_record(
+        async_db,
+        user,
+        platform="android",
+        product_id="ad_free_monthly",
+        plan_id_hint="yearly",
+        purchase_id="GPA.1234-5678",
+        verification_data="gp-token-1",
+        source="purchase",
+    )
+    refreshed = await _user(async_db)
     assert refreshed.ads_free is True
-    assert refreshed.ads_free_until is not None
+    assert refreshed.ads_free_until is None
 
 
 @pytest.mark.asyncio
@@ -350,7 +372,9 @@ async def test_refresh_entitlement_extends_expiry_after_renewal(async_db):
         source="purchase",
     )
     user = await _user(async_db)
-    user.ads_free_until = now - timedelta(days=1)
+    txn = await iap_service.latest_verified_transaction(async_db, user.user_idn)
+    assert txn is not None
+    txn.expires_dt = now - timedelta(days=1)
     await async_db.commit()
 
     renewed = now + timedelta(days=30)
@@ -375,8 +399,10 @@ async def test_refresh_entitlement_extends_expiry_after_renewal(async_db):
     user = await _user(async_db)
     await iap_service.refresh_entitlement_from_store(async_db, user)
     user = await _user(async_db)
-    assert user.ads_free is True
-    until = user.ads_free_until
+    assert user.ads_free is False
+    txn = await iap_service.latest_verified_transaction(async_db, user.user_idn)
+    assert txn is not None
+    until = txn.expires_dt
     assert until is not None
     if until.tzinfo is None:
         until = until.replace(tzinfo=timezone.utc)

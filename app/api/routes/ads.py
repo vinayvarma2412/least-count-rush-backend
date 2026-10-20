@@ -31,6 +31,8 @@ router = APIRouter(prefix="/api/ads", tags=["Ads"])
 class AdsStatusResponse(BaseModel):
     ads_free: bool
     ads_free_until: Optional[datetime]
+    iap_ads_free: bool = False
+    iap_ads_free_until: Optional[datetime] = None
     plan_id: Optional[str] = None
     platform: Optional[str] = None
     today_counts: dict[str, int]
@@ -68,18 +70,20 @@ async def get_ads_status(
     db: AsyncSession = Depends(get_db_session),
 ):
     """
-    Returns the user's ad-free status and today's impression counts per placement.
-    Re-checks the store when a saved purchase token exists so auto-renewals
-    extend ads_free_until without requiring Restore.
+    Returns manual ad-free flags on the user row plus IAP membership from
+    iap_transactions. Store renewals update iap_transactions only.
     """
     current_user = await iap_service.refresh_entitlement_from_store(db, current_user)
     free = await ads_service.is_ads_free(current_user.user_idn, db)
     counts = await ads_service.get_today_counts(current_user.user_idn, db)
     online_games_played = await ads_service.get_online_games_played(current_user.user_idn, db)
     txn = await iap_service.latest_verified_transaction(db, current_user.user_idn)
+    iap_free, iap_until = iap_service.iap_entitlement_from_txn(txn)
     return AdsStatusResponse(
         ads_free=free,
         ads_free_until=current_user.ads_free_until,
+        iap_ads_free=iap_free,
+        iap_ads_free_until=iap_until,
         plan_id=canonicalize_plan_id(txn.plan_id) if txn else None,
         platform=txn.platform if txn else None,
         today_counts=counts,
@@ -100,7 +104,9 @@ async def record_impression(
     """
     # If the user is ad-free we still accept the call but don't increment —
     # they shouldn't be seeing ads anyway; this is just a safety net.
-    if await ads_service.is_ads_free(current_user.user_idn, db):
+    txn = await iap_service.latest_verified_transaction(db, current_user.user_idn)
+    iap_free, _ = iap_service.iap_entitlement_from_txn(txn)
+    if await ads_service.is_ads_free(current_user.user_idn, db) or iap_free:
         counts = await ads_service.get_today_counts(current_user.user_idn, db)
         return RecordImpressionResponse(
             placement=req.placement.value,
