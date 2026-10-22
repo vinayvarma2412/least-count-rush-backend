@@ -116,6 +116,34 @@ async def _record_transaction(
         )
     )
     existing = result.scalar_one_or_none()
+    if existing is None and original_transaction_id:
+        original_match = await db.execute(
+            select(IapTransaction)
+            .where(
+                IapTransaction.platform == platform,
+                IapTransaction.user_idn == user_idn,
+                or_(
+                    IapTransaction.original_transaction_id == original_transaction_id,
+                    IapTransaction.store_transaction_id == original_transaction_id,
+                    IapTransaction.purchase_token == original_transaction_id,
+                ),
+            )
+            .order_by(IapTransaction.expires_dt.desc(), IapTransaction.upd_dt.desc())
+            .limit(1)
+        )
+        existing = original_match.scalar_one_or_none()
+    if existing is None and purchase_token:
+        token_match = await db.execute(
+            select(IapTransaction)
+            .where(
+                IapTransaction.platform == platform,
+                IapTransaction.user_idn == user_idn,
+                IapTransaction.purchase_token == purchase_token,
+            )
+            .order_by(IapTransaction.expires_dt.desc(), IapTransaction.upd_dt.desc())
+            .limit(1)
+        )
+        existing = token_match.scalar_one_or_none()
     if existing:
         if existing.user_idn != user_idn and existing.verification_status == "verified":
             raise await _other_account_error(db, existing)
@@ -313,17 +341,61 @@ def _should_refresh_from_store(user: User, txn: IapTransaction, now: datetime) -
     return (now - checked) >= _REFRESH_MIN_INTERVAL
 
 
-async def refresh_entitlement_from_store(db: AsyncSession, user: User) -> User:
+def _is_missing_store_subscription(message: str) -> bool:
+    text = (message or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "could not find this subscription",
+            "could not find this transaction",
+            "could not find this purchase",
+            "did not find this subscription",
+            "subscription is not active",
+        )
+    )
+
+
+async def expire_verified_subscription(
+    db: AsyncSession,
+    txn: IapTransaction,
+    error_message: str,
+) -> None:
+    now = datetime.now(timezone.utc)
+    original = txn.original_transaction_id or txn.store_transaction_id
+    result = await db.execute(
+        select(IapTransaction).where(
+            IapTransaction.user_idn == txn.user_idn,
+            IapTransaction.platform == txn.platform,
+            IapTransaction.verification_status == "verified",
+            or_(
+                IapTransaction.iap_transaction_idn == txn.iap_transaction_idn,
+                IapTransaction.store_transaction_id == txn.store_transaction_id,
+                IapTransaction.purchase_token == txn.purchase_token,
+                IapTransaction.original_transaction_id == original,
+                IapTransaction.store_transaction_id == original,
+            ),
+        )
+    )
+    for row in result.scalars().all():
+        row.verification_status = "expired"
+        row.error_message = error_message
+        row.upd_dt = now
+    await db.commit()
+
+
+async def refresh_entitlement_from_store(
+    db: AsyncSession, user: User, *, force: bool = False
+) -> User:
     """Re-query Google/Apple with the saved token so renewals update iap_transactions."""
     txn = await latest_verified_transaction(db, user.user_idn)
     if txn is None or not txn.purchase_token:
         return user
     now = datetime.now(timezone.utc)
-    if not _should_refresh_from_store(user, txn, now):
+    if not force and not _should_refresh_from_store(user, txn, now):
         return user
     purchase_id = txn.original_transaction_id or txn.store_transaction_id
     try:
-        await verify_and_record(
+        result = await verify_and_record(
             db,
             user,
             platform=txn.platform,
@@ -333,6 +405,10 @@ async def refresh_entitlement_from_store(db: AsyncSession, user: User) -> User:
             verification_data=txn.purchase_token,
             source="renew",
         )
+        if not result.get("verified"):
+            await expire_verified_subscription(
+                db, txn, "Subscription is not active"
+            )
     except IapVerificationError as e:
         logger.warning(
             "Entitlement store refresh failed user=%s platform=%s: %s",
@@ -340,6 +416,8 @@ async def refresh_entitlement_from_store(db: AsyncSession, user: User) -> User:
             txn.platform,
             e.message,
         )
+        if _is_missing_store_subscription(e.message):
+            await expire_verified_subscription(db, txn, e.message)
     await db.refresh(user)
     return user
 

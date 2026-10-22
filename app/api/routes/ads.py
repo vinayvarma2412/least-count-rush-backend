@@ -9,7 +9,7 @@ Endpoints:
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -68,12 +68,15 @@ class AdsFreeResponse(BaseModel):
 async def get_ads_status(
     current_user: User = Depends(get_current_db_user),
     db: AsyncSession = Depends(get_db_session),
+    force_store: bool = Query(False),
 ):
     """
     Returns manual ad-free flags on the user row plus IAP membership from
     iap_transactions. Store renewals update iap_transactions only.
     """
-    current_user = await iap_service.refresh_entitlement_from_store(db, current_user)
+    current_user = await iap_service.refresh_entitlement_from_store(
+        db, current_user, force=force_store
+    )
     free = await ads_service.is_ads_free(current_user.user_idn, db)
     counts = await ads_service.get_today_counts(current_user.user_idn, db)
     online_games_played = await ads_service.get_online_games_played(current_user.user_idn, db)

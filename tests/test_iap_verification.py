@@ -434,3 +434,137 @@ async def test_refresh_entitlement_skips_store_when_still_valid(async_db):
     user = await _user(async_db)
     await iap_service.refresh_entitlement_from_store(async_db, user)
     assert called.n == 1
+
+
+def _unsigned_jws(payload: dict) -> str:
+    import base64
+    import json
+
+    body = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+    body = body.rstrip("=")
+    return f"e30.{body}.sig"
+
+
+def test_apple_revoked_subscription_is_not_active():
+    from app.services.iap_store_clients import result_from_apple_subscription_status
+
+    future_ms = int((datetime.now(timezone.utc) + timedelta(days=20)).timestamp() * 1000)
+    signed = _unsigned_jws(
+        {
+            "productId": "ad_free_yearly",
+            "transactionId": "txn-2000",
+            "originalTransactionId": "orig-1000",
+            "expiresDate": future_ms,
+            "purchaseDate": future_ms - 1000,
+        }
+    )
+    result = result_from_apple_subscription_status(
+        {
+            "data": [
+                {
+                    "lastTransactions": [
+                        {"status": 5, "signedTransactionInfo": signed}
+                    ]
+                }
+            ]
+        },
+        "Sandbox",
+    )
+    assert result.ok is True
+    assert result.is_active is False
+
+
+def test_apple_active_subscription_status_is_entitled():
+    from app.services.iap_store_clients import result_from_apple_subscription_status
+
+    future_ms = int((datetime.now(timezone.utc) + timedelta(days=20)).timestamp() * 1000)
+    signed = _unsigned_jws(
+        {
+            "productId": "ad_free_yearly",
+            "transactionId": "txn-2000",
+            "originalTransactionId": "orig-1000",
+            "expiresDate": future_ms,
+        }
+    )
+    result = result_from_apple_subscription_status(
+        {"data": [{"lastTransactions": [{"status": 1, "signedTransactionInfo": signed}]}]},
+        "Sandbox",
+    )
+    assert result.ok is True
+    assert result.is_active is True
+
+
+@pytest.mark.asyncio
+async def test_refresh_expires_verified_row_when_apple_clears_subscription(async_db):
+    now = datetime.now(timezone.utc)
+    iap_service.set_store_verifier(
+        FakeStore(
+            StoreVerificationResult(
+                ok=True,
+                product_id="ad_free_yearly",
+                plan_id="yearly",
+                purchase_token="orig-1000",
+                store_transaction_id="txn-2000",
+                original_transaction_id="orig-1000",
+                purchase_dt=now,
+                expires_dt=now + timedelta(days=30),
+                is_active=True,
+                environment="Sandbox",
+            )
+        )
+    )
+    user = await _user(async_db)
+    await iap_service.verify_and_record(
+        async_db,
+        user,
+        platform="ios",
+        product_id="ad_free_yearly",
+        plan_id_hint="yearly",
+        purchase_id="orig-1000",
+        verification_data="orig-1000",
+        source="purchase",
+    )
+    txn = await iap_service.latest_verified_transaction(async_db, user.user_idn)
+    assert txn is not None
+    assert txn.verification_status == "verified"
+
+    iap_service.set_store_verifier(
+        FakeStore(
+            StoreVerificationResult(
+                ok=False, error="Apple could not find this subscription"
+            )
+        )
+    )
+    user = await _user(async_db)
+    await iap_service.refresh_entitlement_from_store(async_db, user, force=True)
+    assert await iap_service.latest_verified_transaction(async_db, user.user_idn) is None
+    rows = (await async_db.execute(select(IapTransaction))).scalars().all()
+    assert rows
+    assert all(row.verification_status != "verified" for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_force_refresh_queries_store_while_subscription_still_valid(async_db):
+    called = SimpleNamespace(n=0)
+
+    class Guard(FakeStore):
+        async def verify_android(self, purchase_token, product_id):
+            called.n += 1
+            return self.result
+
+    iap_service.set_store_verifier(Guard(_active_android(expires_in_days=200)))
+    user = await _user(async_db)
+    await iap_service.verify_and_record(
+        async_db,
+        user,
+        platform="android",
+        product_id="ad_free_monthly",
+        plan_id_hint="yearly",
+        purchase_id="GPA.1234-5678",
+        verification_data="gp-token-1",
+        source="purchase",
+    )
+    assert called.n == 1
+    user = await _user(async_db)
+    await iap_service.refresh_entitlement_from_store(async_db, user, force=True)
+    assert called.n == 2

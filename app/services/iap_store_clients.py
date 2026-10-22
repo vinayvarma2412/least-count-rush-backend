@@ -26,6 +26,9 @@ APPLE_PROD = "https://api.storekit.itunes.apple.com"
 APPLE_SANDBOX = "https://api.storekit-sandbox.itunes.apple.com"
 APPLE_VERIFY_PROD = "https://buy.itunes.apple.com/verifyReceipt"
 APPLE_VERIFY_SANDBOX = "https://sandbox.itunes.apple.com/verifyReceipt"
+# App Store Server API subscription statuses:
+# 1 Active, 2 Expired, 3 Billing Retry, 4 Billing Grace Period, 5 Revoked
+APPLE_SUBSCRIPTION_ACTIVE_STATUSES = {1, 3, 4}
 
 
 def _ms_to_dt(value: Any) -> Optional[datetime]:
@@ -128,6 +131,71 @@ def decode_jws_payload_unverified(jws: str) -> dict:
         return json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
     except Exception:
         return {}
+
+
+def apple_claims_to_result(
+    claims: dict,
+    environment: str,
+    raw: dict,
+    *,
+    subscription_status: Optional[int] = None,
+) -> StoreVerificationResult:
+    bundle = claims.get("bundleId")
+    if bundle and settings.iap_apple_bundle_id and bundle != settings.iap_apple_bundle_id:
+        return StoreVerificationResult(
+            ok=False,
+            error="Apple bundle id does not match this app",
+            raw=claims,
+        )
+    product_id = claims.get("productId") or ""
+    expires = _ms_to_dt(claims.get("expiresDate"))
+    purchased = _ms_to_dt(claims.get("purchaseDate"))
+    now = datetime.now(timezone.utc)
+    revoked = claims.get("revocationDate") is not None
+    is_active = (not revoked) and (expires is None or expires > now)
+    if subscription_status is not None:
+        is_active = is_active and subscription_status in APPLE_SUBSCRIPTION_ACTIVE_STATUSES
+    txn_id = str(claims.get("transactionId") or "")
+    original = str(claims.get("originalTransactionId") or txn_id)
+    return StoreVerificationResult(
+        ok=True,
+        product_id=product_id,
+        plan_id=plan_id_for_product("ios", product_id),
+        purchase_token=original or txn_id,
+        store_transaction_id=txn_id or original,
+        original_transaction_id=original,
+        purchase_dt=purchased,
+        expires_dt=expires,
+        is_active=is_active,
+        environment=claims.get("environment") or environment,
+        raw={"claims": claims, "api": raw, "subscription_status": subscription_status},
+    )
+
+
+def result_from_apple_subscription_status(body: dict, environment: str) -> StoreVerificationResult:
+    """Parse Get All Subscription Statuses. Status 5 (revoked) is not entitled."""
+    for group in body.get("data") or []:
+        for last in group.get("lastTransactions") or []:
+            signed = last.get("signedTransactionInfo") or ""
+            claims = decode_jws_payload_unverified(signed)
+            if not claims:
+                continue
+            status_i = None
+            try:
+                if last.get("status") is not None:
+                    status_i = int(last.get("status"))
+            except (TypeError, ValueError):
+                status_i = None
+            return apple_claims_to_result(
+                claims,
+                environment,
+                {"api": body, "lastTransaction": last},
+                subscription_status=status_i,
+            )
+    return StoreVerificationResult(
+        ok=False,
+        error="Apple could not find this subscription",
+    )
 
 
 @dataclass
@@ -403,15 +471,20 @@ class AppleStoreVerifier:
             if result.ok:
                 return result
             lookup_error = result.error or lookup_error
-            if result.error and "not configured" in result.error:
+            if result.error and "not configured" in (result.error or ""):
                 return result
-        if transaction_id and self._app_store_jwt():
-            result = await self._get_transaction_info(str(transaction_id))
-            if result.ok:
-                return result
-            lookup_error = result.error or lookup_error
-            if result.error and "not configured" in result.error:
-                return result
+            # Cleared / missing subscriptions must not fall through to
+            # transaction history, which still has the old expiry date.
+            if result.error and "could not find this subscription" in (result.error or "").lower():
+                return StoreVerificationResult(
+                    ok=True,
+                    product_id=product_id,
+                    purchase_token=str(original_id),
+                    store_transaction_id=str(transaction_id or original_id),
+                    original_transaction_id=str(original_id),
+                    is_active=False,
+                    error=result.error,
+                )
         if settings.iap_apple_shared_secret:
             return await self._verify_receipt(verification_data, product_id, purchase_id)
         if not self._app_store_jwt():
@@ -445,12 +518,9 @@ class AppleStoreVerifier:
                     )
                     continue
                 body = resp.json()
-                for group in body.get("data") or []:
-                    for last in group.get("lastTransactions") or []:
-                        signed = last.get("signedTransactionInfo") or ""
-                        claims = decode_jws_payload_unverified(signed)
-                        if claims:
-                            return self._result_from_apple_claims(claims, env_name, body)
+                parsed = result_from_apple_subscription_status(body, env_name)
+                if parsed.ok:
+                    return parsed
         return StoreVerificationResult(
             ok=False,
             error="Apple could not find this subscription",
@@ -483,35 +553,10 @@ class AppleStoreVerifier:
         return StoreVerificationResult(ok=False, error="Apple could not find this transaction")
 
     def _result_from_apple_claims(
-        self, claims: dict, environment: str, raw: dict
+        self, claims: dict, environment: str, raw: dict, *, subscription_status: Optional[int] = None
     ) -> StoreVerificationResult:
-        bundle = claims.get("bundleId")
-        if bundle and bundle != settings.iap_apple_bundle_id:
-            return StoreVerificationResult(
-                ok=False,
-                error="Apple bundle id does not match this app",
-                raw=claims,
-            )
-        product_id = claims.get("productId") or ""
-        expires = _ms_to_dt(claims.get("expiresDate"))
-        purchased = _ms_to_dt(claims.get("purchaseDate"))
-        now = datetime.now(timezone.utc)
-        revoked = claims.get("revocationDate") is not None
-        is_active = (not revoked) and (expires is None or expires > now)
-        txn_id = str(claims.get("transactionId") or "")
-        original = str(claims.get("originalTransactionId") or txn_id)
-        return StoreVerificationResult(
-            ok=True,
-            product_id=product_id,
-            plan_id=plan_id_for_product("ios", product_id),
-            purchase_token=original or txn_id,
-            store_transaction_id=txn_id or original,
-            original_transaction_id=original,
-            purchase_dt=purchased,
-            expires_dt=expires,
-            is_active=is_active,
-            environment=claims.get("environment") or environment,
-            raw={"claims": claims, "api": raw},
+        return apple_claims_to_result(
+            claims, environment, raw, subscription_status=subscription_status
         )
 
     async def _verify_receipt(
