@@ -268,7 +268,11 @@ async def verify_and_record(
         environment=store.environment,
         purchase_dt=store.purchase_dt,
         expires_dt=store.expires_dt,
-        acknowledged=store.acknowledged,
+        acknowledged=(
+            True
+            if platform == "ios" and store.is_active
+            else store.acknowledged
+        ),
         error_message=None if store.is_active else "Subscription is not active",
         store_payload=_sanitize_payload(store.raw),
     )

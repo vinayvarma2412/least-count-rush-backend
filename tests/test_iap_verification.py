@@ -116,6 +116,44 @@ async def test_verified_purchase_grants_ads_free_and_records_row(async_db):
 
 
 @pytest.mark.asyncio
+async def test_ios_verified_subscription_is_marked_acknowledged(async_db):
+    now = datetime.now(timezone.utc)
+    iap_service.set_store_verifier(
+        FakeStore(
+            StoreVerificationResult(
+                ok=True,
+                product_id="ad_free_yearly",
+                plan_id="yearly",
+                purchase_token="orig-1000",
+                store_transaction_id="txn-2000",
+                original_transaction_id="orig-1000",
+                purchase_dt=now,
+                expires_dt=now + timedelta(days=30),
+                is_active=True,
+                environment="Sandbox",
+                acknowledged=False,
+            )
+        )
+    )
+    user = await _user(async_db)
+    await iap_service.verify_and_record(
+        async_db,
+        user,
+        platform="ios",
+        product_id="ad_free_yearly",
+        plan_id_hint="yearly",
+        purchase_id="orig-1000",
+        verification_data="orig-1000",
+        source="purchase",
+    )
+    rows = (await async_db.execute(select(IapTransaction))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].platform == "ios"
+    assert rows[0].verification_status == "verified"
+    assert rows[0].acknowledged is True
+
+
+@pytest.mark.asyncio
 async def test_subscribe_does_not_overwrite_manual_ads_free(async_db):
     iap_service.set_store_verifier(FakeStore(_active_android()))
     user = await _user(async_db)

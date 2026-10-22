@@ -168,6 +168,9 @@ def apple_claims_to_result(
         expires_dt=expires,
         is_active=is_active,
         environment=claims.get("environment") or environment,
+        # Apple has no Play-style acknowledgement API. A verified active
+        # subscription is finished on-device via StoreKit completePurchase.
+        acknowledged=is_active,
         raw={"claims": claims, "api": raw, "subscription_status": subscription_status},
     )
 
@@ -615,6 +618,7 @@ class AppleStoreVerifier:
             expires_dt=expires,
             is_active=expires is None or expires > now,
             environment=env,
+            acknowledged=expires is None or expires > now,
             raw={"receipt_status": 0, "transaction": chosen},
         )
 
