@@ -15,8 +15,8 @@ import jwt
 
 from app.config import settings
 from app.services.iap_catalog import (
-    ANDROID_PRODUCT_ID,
     GOOGLE_ACTIVE_STATES,
+    get_android_product_id,
     plan_id_for_product,
 )
 
@@ -340,7 +340,7 @@ class GooglePlayVerifier:
         line_product = item.get("productId") or product_id
         store_product = (
             product_id
-            if product_id == ANDROID_PRODUCT_ID
+            if product_id == get_android_product_id()
             else line_product
         )
         offer = item.get("offerDetails") or {}
