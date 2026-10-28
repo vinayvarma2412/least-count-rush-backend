@@ -440,6 +440,20 @@ async def process_and_broadcast_show_results(room_id: str, showed_by_id: str, re
                             async with get_room_lock(r_id):
                                 await g_service.clear_game(r_id)
                                 await r_service.update_room_status(r_id, RoomStatusEnum.WAITING)
+                                # Clients clear ready while the results dialog is open.
+                                # Put the seated players back to ready immediately
+                                # before the deal, or start_game_for_room refuses.
+                                room_now = await r_service.get_room(r_id)
+                                if room_now:
+                                    for idx, player_obj in enumerate(room_now.players):
+                                        if idx in elim_indices or getattr(player_obj, "is_exited", False):
+                                            continue
+                                        await r_service.update_player_fields(
+                                            r_id,
+                                            player_obj.player_id,
+                                            is_ready=True,
+                                            is_in_game=True,
+                                        )
                                 from app.api.websocket.game_ws import start_game_for_room
                                 started = await start_game_for_room(r_id, eliminated_indices=elim_indices, initial_turn_override=turn_override)
                                 log.info("tournament_next_round_started", {
