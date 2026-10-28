@@ -41,9 +41,9 @@ settings = Settings()
 TURN_TIMEOUT_SECONDS: int = 30
 # How long a public Play With Randoms room waits with exactly one connected
 # player before the game backend asks the bot server for an opponent.
-PUBLIC_ROOM_BOT_WAIT_SECONDS: int = 30
+PUBLIC_ROOM_BOT_WAIT_SECONDS: int = 15
 # One extra attempt if that request fails, this many seconds later.
-BOT_FILL_RETRY_SECONDS: int = 30
+BOT_FILL_RETRY_SECONDS: int = 15
 # Hearts every player starts each round with. 0 lives → eliminated.
 PLAYER_LIVES: int = 3
 # Delay (ms) between sequential animation events emitted by server_play_for_player.
