@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     iap_apple_private_key: str = ""
     iap_apple_private_key_file: str = ""
     iap_apple_shared_secret: str = ""
+    bot_server_url: str = ""
+    bot_server_secret: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -37,6 +39,11 @@ settings = Settings()
 # ── Turn Timer & Lives (configurable here) ──────────────────────────────────
 # Seconds each player has to act on their turn before the server auto-plays.
 TURN_TIMEOUT_SECONDS: int = 30
+# How long a public Play With Randoms room waits with exactly one connected
+# player before the game backend asks the bot server for an opponent.
+PUBLIC_ROOM_BOT_WAIT_SECONDS: int = 30
+# One extra attempt if that request fails, this many seconds later.
+BOT_FILL_RETRY_SECONDS: int = 30
 # Hearts every player starts each round with. 0 lives → eliminated.
 PLAYER_LIVES: int = 3
 # Delay (ms) between sequential animation events emitted by server_play_for_player.

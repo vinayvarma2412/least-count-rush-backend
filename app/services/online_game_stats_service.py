@@ -15,7 +15,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import update
+from sqlalchemy import String, cast, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
@@ -25,9 +25,20 @@ from app.models.db_models import (
     GameModeEnum,
     GameResultEnum,
     GameTypeEnum,
+    User,
+    UserRoleEnum,
 )
 from app.utils.room_logger import global_log
 from app.services.leaderboard_service import leaderboard_service
+
+
+async def _is_bot_user(db: AsyncSession, user_idn: int) -> bool:
+    """True for seeded offline bots and online matchmaking bots."""
+    result = await db.execute(
+        select(cast(User.role, String)).where(User.user_idn == user_idn)
+    )
+    role = result.scalar_one_or_none()
+    return role in (UserRoleEnum.bot.value, UserRoleEnum.online_bot.value)
 
 
 class OnlineGameStatsService:
@@ -229,8 +240,8 @@ class OnlineGameStatsService:
                 except Exception as lb_exc:
                     global_log.error("leaderboard_update_error", {"game_idn": game_idn, "error": str(lb_exc)})
 
-                # Increment Rate Us win counter for the winner (non-fatal)
-                if winner_user_idn is not None:
+                # Increment Rate Us win counter for a human winner (non-fatal).
+                if winner_user_idn is not None and not await _is_bot_user(db, winner_user_idn):
                     try:
                         from app.services.rate_us_service import increment_wins_since_dismissed
                         await increment_wins_since_dismissed(winner_user_idn, db)

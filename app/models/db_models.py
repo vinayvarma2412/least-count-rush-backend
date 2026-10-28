@@ -10,6 +10,7 @@ class UserRoleEnum(str, enum.Enum):
     admin = "admin"
     user = "user"
     bot = "bot"
+    online_bot = "online_bot"
 
 class PlatformEnum(str, enum.Enum):
     ios = "ios"

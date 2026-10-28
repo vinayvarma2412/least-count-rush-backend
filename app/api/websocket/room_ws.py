@@ -645,6 +645,9 @@ async def handle_join_room(websocket: WebSocket, room_id: str, data: Dict):
 
         if not player_exists and room.status == RoomStatus.WAITING and len(room.players) >= 2:
             pass # Server selection is now handled in handle_set_ready when everyone clicks Ready
+
+        from app.services.bot_fill_service import sync_room_safely
+        await sync_room_safely(room)
     else:
         await manager.send_personal_message({
             "type": "error",
@@ -689,6 +692,8 @@ async def _handle_leave_room_internal(websocket: WebSocket, room_id: str, silent
             # Start a 5-minute timer to delete the room if no one rejoins
             if room_id not in _empty_room_timers:
                 _empty_room_timers[room_id] = asyncio.create_task(_empty_room_timeout(room_id))
+            from app.services.bot_fill_service import clear_room_safely
+            await clear_room_safely(room_id)
             return
 
         room = await room_service.get_room(room_id)
@@ -708,6 +713,10 @@ async def _handle_leave_room_internal(websocket: WebSocket, room_id: str, silent
                     "left_player_id": player_id,
                     "error": str(e),
                 })
+
+        if room:
+            from app.services.bot_fill_service import sync_room_safely
+            await sync_room_safely(room)
 
 
 @with_room_lock

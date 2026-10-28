@@ -1,13 +1,14 @@
 from typing import Optional, Dict, Any, List, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import update
+from sqlalchemy import String, cast, update
 from sqlalchemy.dialects.postgresql import insert
 import logging
 
 from app.models.db_models import (
     Game,
     GamePlayer,
+    User,
     UserLeaderboardStat,
     SeasonLeaderboardStat,
     LeaderboardSeason,
@@ -139,8 +140,22 @@ class LeaderboardService:
             except ValueError:
                 pass
                 
+        user_idns = [p.user_idn for p in players if p.user_idn is not None]
+        bot_user_idns: set[int] = set()
+        if user_idns:
+            bot_rows = await db.execute(
+                select(User.user_idn).where(
+                    User.user_idn.in_(user_idns),
+                    cast(User.role, String).in_(("bot", "online_bot")),
+                )
+            )
+            bot_user_idns = {row[0] for row in bot_rows.all()}
+
         for player in players:
             if player.user_idn is None:
+                continue
+            # Offline bots and online matchmaking bots stay out of the rankings.
+            if player.user_idn in bot_user_idns:
                 continue
                 
             if player.user_idn in exited_user_idns:
