@@ -151,7 +151,7 @@ class BotFillService:
             try:
                 ok = await self._poster(fresh)
             except Exception as exc:
-                logger.warning("bot_fill_request_failed", extra={"room_id": room_id, "error": str(exc)})
+                logger.warning("bot_fill_request_failed room_id=%s error=%s", room_id, exc)
                 ok = False
             if ok:
                 await self._store.set(self._assigned_key(room_id), "1", ex=_ASSIGNED_TTL_SECONDS)
