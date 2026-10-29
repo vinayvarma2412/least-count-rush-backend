@@ -68,6 +68,31 @@ def test_otherwise_dump_the_highest_card_and_draw():
     ]
 
 
+class _ScriptedRng:
+    def __init__(self, rolls, picks):
+        self._rolls = list(rolls)
+        self._picks = list(picks)
+
+    def random(self):
+        return self._rolls.pop(0)
+
+    def choice(self, options):
+        return options[self._picks.pop(0)]
+
+
+def test_dump_sometimes_keeps_the_biggest_card():
+    hand = [card("K"), card("9"), card("8")]
+    # Skip the forced-highest roll, pick the 9, then throw that one card.
+    decision = decide(
+        hand,
+        card("7", "clubs"),
+        joker=card("3"),
+        rng=_ScriptedRng([0.9, 0.9], [1]),
+    )
+    assert decision.action == "pick_from_deck"
+    assert [c["rank"] for c in decision.discard_cards] == ["9"]
+
+
 def test_empty_discard_draws_when_the_hand_is_not_showable():
     hand = [card("K"), card("Q")]
     decision = decide(hand, None, joker=None)
