@@ -36,10 +36,12 @@ async def lifespan(app: FastAPI):
             await conn.run_sync(Base.metadata.create_all)
             
     from app.services.bot_fill_service import bot_fill_loop, ensure_online_bot_role
+    from app.services.ready_timeout_service import ready_timeout_loop
     await ensure_online_bot_role()
     asyncio.create_task(room_cleanup_task())
     asyncio.create_task(notification_dispatch_task())
     asyncio.create_task(bot_fill_loop())
+    asyncio.create_task(ready_timeout_loop())
     yield
     # Shutdown
     await engine.dispose()

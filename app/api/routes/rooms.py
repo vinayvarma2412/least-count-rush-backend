@@ -15,6 +15,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 router = APIRouter(prefix="/api/rooms", tags=["rooms"])
 
 
+async def _schedule_public_room_bots(room) -> None:
+    """Start the bot timer when a public room is created."""
+    room_type = getattr(room.room_type, "value", room.room_type)
+    if room_type != "public":
+        return
+    from app.services.bot_fill_service import sync_room_safely
+
+    await sync_room_safely(room)
+
+
 class MatchmakeRequest(BaseModel):
     """Request body for Play With Randoms matchmaking."""
     creator_app_version: Optional[str] = None
@@ -35,8 +45,16 @@ async def matchmake(
     Used by the 'Play With Randoms' feature. Returns a RoomResponse the
     client should then connect to via WebSocket.
     """
-    # Try to find an existing open public room
-    existing_room_id = await room_service.find_open_public_room()
+    # Skip the public lobby this player just left, so Play with Randoms
+    # cannot put them straight back with someone who never tapped Ready.
+    exclude_room_ids = set()
+    left_room_id = await room_service.excluded_public_room_id(user.get("uid") or "")
+    if left_room_id:
+        exclude_room_ids.add(left_room_id)
+
+    existing_room_id = await room_service.find_open_public_room(
+        exclude_room_ids=exclude_room_ids,
+    )
     if existing_room_id:
         room = await room_service.get_room(existing_room_id)
         if room:
@@ -83,6 +101,7 @@ async def matchmake(
         room_type=RoomType.PUBLIC,
     )
     room = await room_service.create_room(room_data)
+    await _schedule_public_room_bots(room)
     return room
 
 
@@ -90,7 +109,18 @@ async def matchmake(
 async def create_room(room_data: RoomCreate, user: dict = Depends(get_current_firebase_user)):
     """Create a new game room"""
     room = await room_service.create_room(room_data)
+    await _schedule_public_room_bots(room)
     return room
+
+
+@router.get("/public/open", response_model=RoomListResponse)
+async def list_open_random_rooms(
+    user: dict = Depends(get_current_firebase_user),
+):
+    """Waiting public rooms a Play with Randoms player can join."""
+    del user
+    rooms = await room_service.list_open_random_rooms()
+    return RoomListResponse(rooms=rooms, total=len(rooms))
 
 
 @router.get("/public/stats", response_model=PublicRoomStatsResponse)

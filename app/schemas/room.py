@@ -53,6 +53,10 @@ class PlayerInfo(BaseModel):
     player_name: str
     avatar_seed: Optional[str] = Field(default=None, description="Seed used by RandomAvatar on clients")
     is_ready: bool = False
+    ready_deadline_at: Optional[datetime] = Field(
+        default=None,
+        description="When this public-lobby player is removed if they are still not ready. Null when the clock is not running.",
+    )
     is_connected: bool = Field(default=False, description="True if player has internet connection and WebSocket is active")
     is_admin: bool = Field(default=False, description="True if player is the room admin")
     is_in_game: bool = Field(default=False, description="True if player has entered the game view (in room or exited)")
