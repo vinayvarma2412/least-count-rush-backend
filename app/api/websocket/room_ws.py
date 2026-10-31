@@ -149,6 +149,8 @@ async def on_player_disconnect(room_id: str, player_id: str, websocket=None, con
                     return
 
         await room_service.set_player_connected(room_id, player_id, False)
+        await room_service.note_public_lobby_leave(room_id, player_id)
+        await room_service.refresh_public_ready_deadlines(room_id)
         # Record disconnect timestamp for countdown badge
         await room_service.set_player_disconnected_at(
             room_id, player_id, datetime.now(timezone.utc)
@@ -599,6 +601,7 @@ async def handle_join_room(websocket: WebSocket, room_id: str, data: Dict):
 
     if success:
         log_to_file("handle_join_room: success is True, getting room")
+        await room_service.refresh_public_ready_deadlines(room_id)
         room = await room_service.get_room(room_id)
         
         # Cancel the empty room deletion timer if it's running
@@ -678,6 +681,8 @@ async def _handle_leave_room_internal(websocket: WebSocket, room_id: str, silent
 
     if player_id:
         await room_service.set_player_connected(room_id, player_id, False)
+        await room_service.note_public_lobby_leave(room_id, player_id)
+        await room_service.refresh_public_ready_deadlines(room_id)
 
         if was_admin:
             new_admin_id = await room_service.transfer_admin(room_id, player_id)
@@ -742,6 +747,7 @@ async def handle_player_ready(websocket: WebSocket, room_id: str, data: Dict):
     success = await room_service.set_player_ready(room_id, player_id, is_ready)
 
     if success:
+        await room_service.refresh_public_ready_deadlines(room_id)
         room = await room_service.get_room(room_id)
         is_public = room.room_type.value == "public"
         

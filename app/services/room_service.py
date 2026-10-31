@@ -12,7 +12,7 @@ import uuid
 import json
 import random
 from datetime import datetime, timezone
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Set
 from app.schemas.room import RoomCreate, RoomResponse, RoomStatus, RoomType, PlayerInfo
 from app.utils.room_logger import get_room_logger, close_room_logger, global_log
 from app.services.redis_client import redis_client, KEY_TTL_SECONDS
@@ -41,7 +41,7 @@ def _room_from_json(raw: str) -> dict:
     # Reconstruct player datetime fields
     for player_list_key in ("players", "waiting_players"):
         for p in room.get(player_list_key, []):
-            for dt_field in ("disconnect_at", "exited_at"):
+            for dt_field in ("disconnect_at", "exited_at", "ready_deadline_at"):
                 if p.get(dt_field):
                     p[dt_field] = datetime.fromisoformat(p[dt_field])
     # status is stored as its .value string — RoomStatus is a str enum so it
@@ -166,6 +166,28 @@ class RoomService:
         in_players = any(p["player_id"] == player_id for p in room["players"])
         in_waiting = any(p["player_id"] == player_id for p in room.get("waiting_players", []))
         return in_players or in_waiting
+
+    async def list_open_random_rooms(
+        self,
+        exclude_room_ids: Optional[Set[str]] = None,
+    ) -> List[RoomResponse]:
+        """Public waiting rooms with a free seat, including rooms players have left."""
+        from app.services.random_room_listing import is_open_random_room
+
+        now = datetime.now(timezone.utc)
+        exclude_room_ids = exclude_room_ids or set()
+        rooms = []
+        room_ids = await redis_client.smembers("rooms:public_index")
+        for room_id in room_ids:
+            room = await self._load_room(room_id)
+            if room is None:
+                await redis_client.srem("rooms:public_index", room_id)
+                await redis_client.srem("rooms:index", room_id)
+                continue
+            if is_open_random_room(room, now, exclude_room_ids):
+                rooms.append(RoomResponse(**room))
+        rooms.sort(key=lambda room: room.created_at)
+        return rooms
 
     async def list_rooms(self, status: Optional[RoomStatus] = None) -> List[RoomResponse]:
         """List all rooms, optionally filtered by status."""
@@ -625,7 +647,53 @@ class RoomService:
 
         return True
 
-    async def find_open_public_room(self) -> Optional[str]:
+    async def refresh_public_ready_deadlines(
+        self,
+        room_id: str,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """Arm or clear public-lobby ready deadlines. Returns True if the room changed."""
+        from app.services.ready_timeout import apply_ready_deadlines
+
+        room = await self._load_room(room_id)
+        if not room:
+            return False
+        changed = apply_ready_deadlines(room, now or datetime.now(timezone.utc))
+        if changed:
+            await self._save_room(room)
+        return changed
+
+    async def note_public_lobby_leave(self, room_id: str, player_id: str) -> None:
+        """Remember this public waiting room so matchmaking will not return it."""
+        from app.services.ready_timeout import exclude_ttl_seconds
+
+        if not player_id:
+            return
+        room = await self._load_room(room_id)
+        if not room:
+            return
+        room_type = room.get("room_type")
+        is_public = room_type in (RoomType.PUBLIC, RoomType.PUBLIC.value, "public")
+        status = room.get("status")
+        is_waiting = status in (RoomStatus.WAITING, RoomStatus.WAITING.value, "waiting")
+        if not is_public or not is_waiting:
+            return
+        await redis_client.set(
+            f"matchmake:left:{player_id}",
+            room_id,
+            ex=exclude_ttl_seconds(),
+        )
+
+    async def excluded_public_room_id(self, player_id: str) -> Optional[str]:
+        """Room this player left recently, if matchmaking should skip it."""
+        if not player_id:
+            return None
+        return await redis_client.get(f"matchmake:left:{player_id}")
+
+    async def find_open_public_room(
+        self,
+        exclude_room_ids: Optional[Set[str]] = None,
+    ) -> Optional[str]:
         """Find the first open public room eligible for matchmaking.
 
         Eligibility rules (ALL must pass):
@@ -634,9 +702,13 @@ class RoomService:
           2. At least 1 player is actively connected (is_connected=True, disconnect_at=None)
           3. Room was created less than 1 hour ago
           4. Room is not full
+          5. Not in exclude_room_ids, and no connected player is past their ready deadline
         """
+        from app.services.ready_timeout import matchmaking_block_reason
+
         now = datetime.now(timezone.utc)
         max_age_seconds = 3600  # 1 hour
+        exclude_room_ids = exclude_room_ids or set()
 
         room_ids = await redis_client.smembers("rooms:public_index")
         for room_id in room_ids:
@@ -672,6 +744,13 @@ class RoomService:
             )
             if not has_active_player:
                 # All players offline / in grace period — skip
+                continue
+
+            block_reason = matchmaking_block_reason(room, now, exclude_room_ids)
+            if block_reason:
+                get_room_logger(room_id).info("public_room_skipped_for_matchmaking", {
+                    "reason": block_reason,
+                })
                 continue
 
             # ── Rule 3: room age < 1 hour ────────────────────────────────────

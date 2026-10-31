@@ -1,8 +1,9 @@
-"""Ask the bot server to fill a public room that is still alone.
+"""Ask the bot server to fill a public room on a growing timer.
 
-The wait length lives in app.config.PUBLIC_ROOM_BOT_WAIT_SECONDS.
-A Redis deadline is stored when a public room is waiting with exactly one
-connected player. A background loop fires due deadlines once.
+The timer starts when the room is created. The first bot waits
+PUBLIC_ROOM_BOT_WAIT_SECONDS, the second waits twice that, and the third
+waits three times that. A bot is requested only when exactly one real
+player is in the room, that player is connected, and a seat is free.
 """
 from __future__ import annotations
 
@@ -17,34 +18,99 @@ from app.config import BOT_FILL_RETRY_SECONDS, PUBLIC_ROOM_BOT_WAIT_SECONDS, set
 logger = logging.getLogger(__name__)
 
 INDEX_KEY = "botfill:index"
-_ASSIGNED_TTL_SECONDS = 4 * 3600
+MAX_PUBLIC_ROOM_BOTS = 3
 
 LoadRoom = Callable[[str], Awaitable[Optional[dict]]]
 Poster = Callable[[dict], Awaitable[bool]]
 Clock = Callable[[], float]
 
 
-def room_snapshot(room) -> dict:
+def bot_wait_seconds(bot_number: int, base_seconds: int) -> int:
+    """1st bot waits 1x the configured timer, 2nd waits 2x, 3rd waits 3x."""
+    return base_seconds * bot_number
+
+
+def _player_dict(player) -> dict:
+    if isinstance(player, dict):
+        return player
+    if hasattr(player, "model_dump"):
+        return player.model_dump()
+    return {
+        "player_id": getattr(player, "player_id", ""),
+        "is_connected": getattr(player, "is_connected", False),
+        "is_exited": getattr(player, "is_exited", False),
+        "disconnect_at": getattr(player, "disconnect_at", None),
+    }
+
+
+def room_snapshot(room, bot_ids: Optional[set] = None) -> dict:
     """Plain dict the scheduler can store and the bot server can be called with."""
     status = getattr(room.status, "value", room.status)
     room_type = getattr(room.room_type, "value", room.room_type)
     people = list(room.players) + list(getattr(room, "waiting_players", None) or [])
-    connected = sum(1 for player in people if getattr(player, "is_connected", False))
+    bots = bot_ids or set()
+    active_humans = 0
+    humans_present = 0
+    bots_present = 0
+    seated = 0
+    for player in people:
+        data = _player_dict(player)
+        if data.get("is_exited"):
+            continue
+        seated += 1
+        player_id = data.get("player_id") or ""
+        if player_id in bots:
+            bots_present += 1
+            continue
+        humans_present += 1
+        if data.get("is_connected") and not data.get("disconnect_at"):
+            active_humans += 1
     return {
         "room_id": room.room_id,
         "room_code": getattr(room, "room_code", "") or "",
         "status": status,
         "room_type": room_type,
         "server_url": getattr(room, "server_url", None) or os.getenv("PUBLIC_SERVER_URL") or "",
-        "connected_players": connected,
+        "active_humans": active_humans,
+        "humans_present": humans_present,
+        "bots_present": bots_present,
+        "seated": seated,
+        "max_players": getattr(room, "max_players", None) or 6,
+        "roles_known": True,
     }
 
 
-def _should_wait(snapshot: dict) -> bool:
+def _has_a_seat(snapshot: dict) -> bool:
+    return int(snapshot.get("seated") or 0) < int(snapshot.get("max_players") or 6)
+
+
+def _below_bot_cap(snapshot: dict) -> bool:
+    return int(snapshot.get("bots_present") or 0) < MAX_PUBLIC_ROOM_BOTS
+
+
+def _one_real_player(snapshot: dict) -> bool:
+    return int(snapshot.get("humans_present") or 0) <= 1
+
+
+def _should_schedule(snapshot: dict) -> bool:
+    """Keep the timer while one real player, or nobody yet, can still be filled."""
     return (
         snapshot.get("room_type") == "public"
         and snapshot.get("status") == "waiting"
-        and snapshot.get("connected_players") == 1
+        and _has_a_seat(snapshot)
+        and _below_bot_cap(snapshot)
+        and _one_real_player(snapshot)
+    )
+
+
+def _can_add_bot(snapshot: dict) -> bool:
+    """A bot joins only when the single real player is still connected."""
+    if snapshot.get("roles_known") is False:
+        return False
+    return (
+        _should_schedule(snapshot)
+        and int(snapshot.get("humans_present") or 0) == 1
+        and int(snapshot.get("active_humans") or 0) == 1
     )
 
 
@@ -81,26 +147,19 @@ class BotFillService:
     def _wait_key(self, room_id: str) -> str:
         return f"botfill:wait:{room_id}"
 
-    def _assigned_key(self, room_id: str) -> str:
-        return f"botfill:assigned:{room_id}"
-
     def _lock_key(self, room_id: str) -> str:
         return f"botfill:lock:{room_id}"
 
     async def sync_snapshot(self, snapshot: dict) -> None:
         """Schedule, keep, or cancel the wait for this room."""
         room_id = snapshot["room_id"]
-        if await self._is_assigned(room_id):
+        if not _should_schedule(snapshot):
             await self._clear_wait(room_id)
             return
-        if not _should_wait(snapshot):
-            await self._clear_wait(room_id)
-            return
-        await self._ensure_wait(room_id)
+        await self._ensure_wait(room_id, int(snapshot.get("bots_present") or 0))
 
     async def clear_room(self, room_id: str) -> None:
         await self._clear_wait(room_id)
-        await self._store.delete(self._assigned_key(room_id))
 
     async def process_due(self) -> list[str]:
         """Fire every deadline that has passed. Returns room ids that were requested."""
@@ -124,15 +183,11 @@ class BotFillService:
         if float(record.get("due_at", 0)) > self._clock():
             return False
 
-        if await self._is_assigned(room_id):
-            await self._clear_wait(room_id)
-            return False
-
         snapshot = await self._load_room(room_id)
         if snapshot is None:
             await self.clear_room(room_id)
             return False
-        if not _should_wait(snapshot):
+        if not _should_schedule(snapshot):
             await self._clear_wait(room_id)
             return False
 
@@ -140,13 +195,19 @@ class BotFillService:
         if not locked:
             return False
         try:
-            # Re-check after the lock so two loops cannot both call the bot server.
-            if await self._is_assigned(room_id):
+            fresh = await self._load_room(room_id)
+            if fresh is None or not _should_schedule(fresh):
                 await self._clear_wait(room_id)
                 return False
-            fresh = await self._load_room(room_id)
-            if fresh is None or not _should_wait(fresh):
+            scheduled_for = max(
+                int(record.get("scheduled_for") or 1),
+                int(fresh.get("bots_present") or 0) + 1,
+            )
+            if scheduled_for > MAX_PUBLIC_ROOM_BOTS:
                 await self._clear_wait(room_id)
+                return False
+            if not _can_add_bot(fresh):
+                await self._postpone(room_id, record, scheduled_for)
                 return False
             try:
                 ok = await self._poster(fresh)
@@ -154,16 +215,22 @@ class BotFillService:
                 logger.warning("bot_fill_request_failed room_id=%s error=%s", room_id, exc)
                 ok = False
             if ok:
-                await self._store.set(self._assigned_key(room_id), "1", ex=_ASSIGNED_TTL_SECONDS)
-                await self._clear_wait(room_id)
-                logger.info("bot_fill_requested room_id=%s", room_id)
+                logger.info(
+                    "bot_fill_requested room_id=%s bot_number=%s",
+                    room_id,
+                    scheduled_for,
+                )
+                if scheduled_for >= MAX_PUBLIC_ROOM_BOTS:
+                    await self._clear_wait(room_id)
+                else:
+                    await self._write_wait(room_id, scheduled_for + 1, retries=0)
                 return True
-            retries = int(record.get("retries", 0))
-            if retries >= 1:
-                logger.warning("bot_fill_gave_up room_id=%s", room_id)
-                await self._clear_wait(room_id)
+            retries = int(record.get("retries", 0)) + 1
+            if retries > 1:
+                await self._postpone(room_id, record, scheduled_for)
                 return False
-            record["retries"] = retries + 1
+            record["retries"] = retries
+            record["scheduled_for"] = scheduled_for
             record["due_at"] = self._clock() + self.retry_seconds
             await self._store.set(
                 self._wait_key(room_id),
@@ -174,20 +241,55 @@ class BotFillService:
         finally:
             await self._store.delete(self._lock_key(room_id))
 
-    async def _is_assigned(self, room_id: str) -> bool:
-        return await self._store.get(self._assigned_key(room_id)) is not None
-
-    async def _ensure_wait(self, room_id: str) -> None:
-        payload = json.dumps({"due_at": self._clock() + self.wait_seconds, "retries": 0})
-        created = await set_if_absent(
-            self._store,
+    async def _postpone(self, room_id: str, record: dict, scheduled_for: int) -> None:
+        """No active player, or the request failed twice. Wait this step again."""
+        record["retries"] = 0
+        record["scheduled_for"] = scheduled_for
+        record["due_at"] = self._clock() + bot_wait_seconds(scheduled_for, self.wait_seconds)
+        await self._store.set(
             self._wait_key(room_id),
-            payload,
-            ex=self.wait_seconds + 120,
+            json.dumps(record),
+            ex=bot_wait_seconds(scheduled_for, self.wait_seconds) + 120,
         )
+
+    async def _ensure_wait(self, room_id: str, bots_present: int) -> None:
+        scheduled_for = bots_present + 1
+        if scheduled_for > MAX_PUBLIC_ROOM_BOTS:
+            await self._clear_wait(room_id)
+            return
+        created = await self._write_wait(room_id, scheduled_for, retries=0, only_if_absent=True)
         await self._store.sadd(INDEX_KEY, room_id)
         if created:
-            logger.info("bot_fill_scheduled room_id=%s wait_seconds=%s", room_id, self.wait_seconds)
+            logger.info(
+                "bot_fill_scheduled room_id=%s bot_number=%s wait_seconds=%s",
+                room_id,
+                scheduled_for,
+                bot_wait_seconds(scheduled_for, self.wait_seconds),
+            )
+
+    async def _write_wait(
+        self,
+        room_id: str,
+        scheduled_for: int,
+        retries: int,
+        only_if_absent: bool = False,
+    ) -> bool:
+        wait = bot_wait_seconds(scheduled_for, self.wait_seconds)
+        payload = json.dumps({
+            "due_at": self._clock() + wait,
+            "retries": retries,
+            "scheduled_for": scheduled_for,
+        })
+        if only_if_absent:
+            return await set_if_absent(
+                self._store,
+                self._wait_key(room_id),
+                payload,
+                ex=wait + 120,
+            )
+        await self._store.set(self._wait_key(room_id), payload, ex=wait + 120)
+        await self._store.sadd(INDEX_KEY, room_id)
+        return True
 
     async def _clear_wait(self, room_id: str) -> None:
         await self._store.delete(self._wait_key(room_id))
@@ -221,13 +323,49 @@ async def _post_join(snapshot: dict) -> bool:
     return True
 
 
+async def _bot_player_ids(player_ids: list[str]) -> Optional[set]:
+    """Firebase uids in this room that are bots. None when the lookup fails."""
+    if not player_ids:
+        return set()
+    from sqlalchemy import select
+
+    from app.database import AsyncSessionLocal
+    from app.models.db_models import User, UserRoleEnum
+
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(User.user_id).where(
+                    User.user_id.in_(player_ids),
+                    User.role.in_([UserRoleEnum.bot, UserRoleEnum.online_bot]),
+                )
+            )
+            return {row[0] for row in result.all() if row[0]}
+    except Exception as exc:
+        logger.warning("bot_fill_role_lookup_failed %s", exc)
+        return None
+
+
+async def snapshot_for_room(room) -> dict:
+    people = list(room.players) + list(getattr(room, "waiting_players", None) or [])
+    player_ids = []
+    for player in people:
+        data = _player_dict(player)
+        if data.get("player_id"):
+            player_ids.append(data["player_id"])
+    bot_ids = await _bot_player_ids(player_ids)
+    snapshot = room_snapshot(room, bot_ids or set())
+    snapshot["roles_known"] = bot_ids is not None
+    return snapshot
+
+
 async def _load_room(room_id: str) -> Optional[dict]:
     from app.services.room_service import room_service
 
     room = await room_service.get_room(room_id)
     if room is None:
         return None
-    return room_snapshot(room)
+    return await snapshot_for_room(room)
 
 
 _service: Optional[BotFillService] = None
@@ -246,7 +384,7 @@ async def sync_room_safely(room) -> None:
     if room is None:
         return
     try:
-        await get_bot_fill_service().sync_snapshot(room_snapshot(room))
+        await get_bot_fill_service().sync_snapshot(await snapshot_for_room(room))
     except Exception as exc:
         logger.warning("bot_fill_sync_failed room_id=%s error=%s", getattr(room, "room_id", ""), exc)
 
