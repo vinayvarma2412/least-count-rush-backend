@@ -1,4 +1,4 @@
-"""Public-room bots join on a 1x, 2x, then 3x timer while one human is active."""
+"""Exactly one bot joins a public room after the configured wait; no more bots are added."""
 import pytest
 
 from app.services.bot_fill_service import INDEX_KEY, BotFillService, bot_wait_seconds
@@ -77,14 +77,16 @@ def _service(poster, rooms, wait_seconds=120):
     return service, now
 
 
-def test_wait_grows_by_the_bot_number():
-    assert bot_wait_seconds(1, 15) == 15
-    assert bot_wait_seconds(2, 15) == 30
-    assert bot_wait_seconds(3, 15) == 45
+def test_wait_is_always_the_base_regardless_of_bot_number():
+    """bot_wait_seconds no longer multiplies; every call returns the base value."""
+    assert bot_wait_seconds(1, 30) == 30
+    assert bot_wait_seconds(2, 30) == 30
+    assert bot_wait_seconds(3, 30) == 30
 
 
 @pytest.mark.asyncio
-async def test_three_bots_wait_one_two_then_three_times_the_timer():
+async def test_exactly_one_bot_joins_then_no_more():
+    """After a single bot joins the timer is cleared and no further bots are requested."""
     calls = []
 
     async def poster(snapshot):
@@ -97,19 +99,15 @@ async def test_three_bots_wait_one_two_then_three_times_the_timer():
     await service.sync_snapshot(rooms["room-1"])
     assert await service.process_due() == []
 
+    # Advance past the wait period.
     now["t"] += 120
     assert await service.process_due() == ["room-1"]
+    assert calls == ["room-1"]
 
-    now["t"] += 240
-    assert await service.process_due() == ["room-1"]
-
-    now["t"] += 360
-    assert await service.process_due() == ["room-1"]
-    assert calls == ["room-1", "room-1", "room-1"]
-
+    # The timer must be cleared after the bot joined — no further requests.
     now["t"] += 1000
     assert await service.process_due() == []
-    assert calls == ["room-1", "room-1", "room-1"]
+    assert calls == ["room-1"]  # still just one call
 
 
 @pytest.mark.asyncio
@@ -164,19 +162,22 @@ async def test_a_second_real_player_cancels_the_bot():
 
 
 @pytest.mark.asyncio
-async def test_bots_already_seated_do_not_count_as_the_second_player():
+async def test_bot_already_seated_prevents_a_second_bot():
+    """With MAX_PUBLIC_ROOM_BOTS=1 a room that already has one bot must never get another."""
     calls = []
 
     async def poster(snapshot):
         calls.append(snapshot["room_id"])
         return True
 
+    # One human + one bot already seated.
     rooms = {"room-1": _room(active_humans=1, humans_present=1, bots_present=1)}
     service, now = _service(poster, rooms)
     await service.sync_snapshot(rooms["room-1"])
-    now["t"] += 240
-    assert await service.process_due() == ["room-1"]
-    assert calls == ["room-1"]
+    now["t"] += 500
+    # The bot cap is already hit, so no further bot should be added.
+    assert await service.process_due() == []
+    assert calls == []
 
 
 @pytest.mark.asyncio

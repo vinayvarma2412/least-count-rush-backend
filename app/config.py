@@ -39,12 +39,12 @@ settings = Settings()
 # ── Turn Timer & Lives (configurable here) ──────────────────────────────────
 # Seconds each player has to act on their turn before the server auto-plays.
 TURN_TIMEOUT_SECONDS: int = 30
-# Base wait before the first bot joins a public room. The second bot waits
-# twice this long, and the third waits three times this long.
-PUBLIC_ROOM_BOT_WAIT_SECONDS: int = 15
-# Once a public lobby has two connected players, each player who has not
+# Seconds to wait from the moment a room has exactly one real player before
+# adding a single bot. Once that bot joins no further bots are ever added.
+PUBLIC_ROOM_BOT_WAIT_SECONDS: int = 30
+# Once half the players in a public lobby are ready, each player who has not
 # tapped Ready is removed after this many seconds.
-PUBLIC_READY_TIMEOUT_SECONDS: int = 15
+PUBLIC_READY_TIMEOUT_SECONDS: int = 30
 # After leaving a public lobby, matchmaking will not put that player back
 # into the same room for this long.
 PUBLIC_MATCHMAKE_EXCLUDE_SECONDS: int = 180

@@ -21,17 +21,56 @@ router = APIRouter(prefix="/api/games", tags=["games"])
 
 # In-memory tournament scores per room (for online scoreboard)
 _tournament_scores: dict[str, dict] = {}
+# Rooms whose board should be dropped on the next brand-new deal.
+# A lobby reset must not drop it immediately: the results screen still
+# reads these totals, and a bot often returns the room to waiting first.
+_pending_score_resets: set[str] = set()
 
 
 def clear_tournament_scores(room_id: str):
     """Clear tournament scores and online game tracking for a given room"""
     _tournament_scores.pop(room_id, None)
+    _pending_score_resets.discard(room_id)
     try:
         from app.api.websocket.game_ws import _online_game_ids, _online_game_started_at
         _online_game_ids.pop(room_id, None)
         _online_game_started_at.pop(room_id, None)
     except Exception:
         pass
+
+
+def request_tournament_score_reset(room_id: str) -> None:
+    """Remember that the next new game should start with a fresh scoreboard.
+
+    The current board stays readable until that deal begins.
+    """
+    _pending_score_resets.add(room_id)
+
+
+def tournament_still_in_progress(room_id: str) -> bool:
+    """True when more than one player is still in a tournament that has rounds."""
+    data = _tournament_scores.get(room_id)
+    if not data or not data.get("rounds"):
+        return False
+    eliminated = set(data.get("eliminated") or [])
+    exited = set((data.get("exited_rounds") or {}).keys())
+    active = [
+        pid
+        for pid in (data.get("player_ids") or [])
+        if pid not in eliminated and pid not in exited
+    ]
+    return len(active) > 1
+
+
+def should_reset_scores_for_new_deal(room_id: str) -> bool:
+    """A brand-new deal drops a finished board, or one a reset already asked to drop.
+
+    An in-progress tournament with no reset request keeps its rounds so the
+    next round can add to them.
+    """
+    if room_id in _pending_score_resets:
+        return True
+    return not tournament_still_in_progress(room_id)
 
 
 async def _get_exited_or_eliminated_player_ids(room_id: str, room) -> set[str]:

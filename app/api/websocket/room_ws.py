@@ -180,6 +180,10 @@ async def on_player_disconnect(room_id: str, player_id: str, websocket=None, con
                                     "type": "room_update",
                                     "data": updated_r.model_dump(mode='json')
                                 }, r_id)
+                                # Re-evaluate bot fill: the room may now have exactly
+                                # one real player left and need the countdown to start.
+                                from app.services.bot_fill_service import sync_room_safely
+                                await sync_room_safely(updated_r)
             asyncio.create_task(_delayed_remove(room_id, player_id))
 
         reverted_intermediate_state = False
@@ -763,9 +767,9 @@ async def handle_player_ready(websocket: WebSocket, room_id: str, data: Dict):
             # All players are in the lobby and ready, but room is not WAITING.
             # This means they abandoned the previous game (or it finished) and want to start a new one.
             log.info("abandoned_game_reset_triggered", {"room_id": room_id})
-            from app.api.routes.games import clear_tournament_scores
+            from app.api.routes.games import request_tournament_score_reset
             await game_service.clear_game(room_id)
-            clear_tournament_scores(room_id)
+            request_tournament_score_reset(room_id)
             await room_service.update_room_status(room_id, RoomStatus.WAITING)
             await room_service.reset_exited_players(room_id)
             room = await room_service.get_room(room_id)
@@ -976,9 +980,9 @@ async def handle_reset_game(websocket: WebSocket, room_id: str, data: Dict):
         await manager.send_personal_message({"type": "error", "message": "Only room admin can reset the game"}, websocket)
         return
 
-    from app.api.routes.games import clear_tournament_scores
+    from app.api.routes.games import request_tournament_score_reset
     await game_service.clear_game(room_id)
-    clear_tournament_scores(room_id)
+    request_tournament_score_reset(room_id)
     await room_service.update_room_status(room_id, RoomStatus.WAITING)
     await room_service.merge_waiting_players(room_id)
     await room_service.reset_exited_players(room_id)  # Clear exited state for new game
@@ -1017,9 +1021,9 @@ async def handle_update_room_status_to_waiting(websocket: WebSocket, room_id: st
         await manager.send_personal_message({"type": "error", "message": "Player not found in room"}, websocket)
         return
 
-    from app.api.routes.games import clear_tournament_scores
+    from app.api.routes.games import request_tournament_score_reset
     await game_service.clear_game(room_id)
-    clear_tournament_scores(room_id)
+    request_tournament_score_reset(room_id)
     await room_service.update_room_status(room_id, RoomStatus.WAITING)
     await room_service.merge_waiting_players(room_id)
     # When "Play Again" is clicked, we are starting a BRAND NEW game/tournament.

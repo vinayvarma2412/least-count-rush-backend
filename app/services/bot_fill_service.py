@@ -1,9 +1,14 @@
-"""Ask the bot server to fill a public room on a growing timer.
+"""Ask the bot server to fill a public room after a configured delay.
 
-The timer starts when the room is created. The first bot waits
-PUBLIC_ROOM_BOT_WAIT_SECONDS, the second waits twice that, and the third
-waits three times that. A bot is requested only when exactly one real
-player is in the room, that player is connected, and a seat is free.
+The countdown starts the moment the room has exactly one real player.
+At the end of the wait, if no second human has joined, exactly one bot
+is added.  No further bots are ever scheduled after that – so a room
+will never have more than one bot.  A bot is requested only when:
+
+  - the room is public and still in the "waiting" state
+  - exactly one real human is present and connected
+  - at least one seat is still free
+  - no bot has joined yet
 """
 from __future__ import annotations
 
@@ -18,7 +23,7 @@ from app.config import BOT_FILL_RETRY_SECONDS, PUBLIC_ROOM_BOT_WAIT_SECONDS, set
 logger = logging.getLogger(__name__)
 
 INDEX_KEY = "botfill:index"
-MAX_PUBLIC_ROOM_BOTS = 3
+MAX_PUBLIC_ROOM_BOTS = 1
 
 LoadRoom = Callable[[str], Awaitable[Optional[dict]]]
 Poster = Callable[[dict], Awaitable[bool]]
@@ -26,8 +31,13 @@ Clock = Callable[[], float]
 
 
 def bot_wait_seconds(bot_number: int, base_seconds: int) -> int:
-    """1st bot waits 1x the configured timer, 2nd waits 2x, 3rd waits 3x."""
-    return base_seconds * bot_number
+    """Wait exactly one configured interval regardless of which bot number this is.
+
+    Previously the n-th bot waited n× the base.  With a cap of one bot the
+    multiplier is always 1, but the parameter is kept for backward-compatible
+    call-sites and tests.
+    """
+    return base_seconds
 
 
 def _player_dict(player) -> dict:

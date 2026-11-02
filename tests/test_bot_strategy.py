@@ -1,4 +1,4 @@
-"""Online bot decisions match the offline Dart BotLogic rules."""
+"""Online bot turn decisions."""
 import sys
 from pathlib import Path
 
@@ -6,7 +6,13 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from bot_server.strategy import animation_script, decide, messages_for_step, plan_steps
+from bot_server.strategy import (
+    active_hand_counts,
+    animation_script,
+    decide,
+    messages_for_step,
+    plan_steps,
+)
 
 
 def card(rank, suit="hearts"):
@@ -21,11 +27,46 @@ def card(rank, suit="hearts"):
     }
 
 
-def test_show_when_score_is_under_11():
+def test_show_bands_follow_opponent_hand_sizes():
+    # A+3+5 = 9. Show at 9–10 only when every opponent has more than 5 cards.
     hand = [card("A"), card("3"), card("5")]
-    decision = decide(hand, card("K", "spades"), joker=card("9", "clubs"))
+    decision = decide(
+        hand, card("K", "spades"), joker=card("9", "clubs"), opponent_counts=[6, 7]
+    )
     assert decision.action == "show"
     assert plan_steps(decision) == ["show"]
+
+    held = decide(
+        hand, card("K", "spades"), joker=card("9", "clubs"), opponent_counts=[6, 5]
+    )
+    assert held.action == "pick_from_deck"
+
+    # A+3+4 = 8. Show at 6–8 only when every opponent has more than 3 cards.
+    mid = [card("A"), card("3"), card("4")]
+    assert decide(
+        mid, card("K"), joker=card("9"), opponent_counts=[4]
+    ).action == "show"
+    assert decide(
+        mid, card("K"), joker=card("9"), opponent_counts=[3, 8]
+    ).action == "pick_from_deck"
+
+    # Below 6, show no matter how few cards an opponent has.
+    low = [card("A"), card("4")]
+    assert decide(
+        low, card("K"), joker=card("9"), opponent_counts=[1]
+    ).action == "show"
+
+
+def test_eliminated_opponents_do_not_block_a_show():
+    counts = active_hand_counts([
+        {"in_hand_cards_count": 2, "is_eliminated": True},
+        {"in_hand_cards_count": 6, "is_exited": False},
+    ])
+    assert counts == [6]
+    hand = [card("A"), card("3"), card("5")]
+    assert decide(
+        hand, card("K"), joker=card("9"), opponent_counts=counts
+    ).action == "show"
 
 
 def test_slash_matching_rank_before_drawing():
@@ -68,29 +109,23 @@ def test_otherwise_dump_the_highest_card_and_draw():
     ]
 
 
-class _ScriptedRng:
-    def __init__(self, rolls, picks):
-        self._rolls = list(rolls)
-        self._picks = list(picks)
-
-    def random(self):
-        return self._rolls.pop(0)
-
-    def choice(self, options):
-        return options[self._picks.pop(0)]
-
-
-def test_dump_sometimes_keeps_the_biggest_card():
-    hand = [card("K"), card("9"), card("8")]
-    # Skip the forced-highest roll, pick the 9, then throw that one card.
-    decision = decide(
-        hand,
-        card("7", "clubs"),
-        joker=card("3"),
-        rng=_ScriptedRng([0.9, 0.9], [1]),
-    )
+def test_dump_drops_a_set_that_removes_more_than_the_highest_card():
+    # King is the dearest single card (10), but the two 7s remove 14.
+    hand = [
+        card("7", "hearts"),
+        card("7", "diamonds"),
+        card("10", "hearts"),
+        card("K", "diamonds"),
+    ]
+    decision = decide(hand, card("4", "clubs"), joker=card("3"))
     assert decision.action == "pick_from_deck"
-    assert [c["rank"] for c in decision.discard_cards] == ["9"]
+    assert [c["rank"] for c in decision.discard_cards] == ["7", "7"]
+
+
+def test_dump_keeps_the_highest_card_when_a_set_only_ties_it():
+    hand = [card("5", "hearts"), card("5", "diamonds"), card("K", "spades")]
+    decision = decide(hand, card("9", "clubs"), joker=card("3"))
+    assert [c["rank"] for c in decision.discard_cards] == ["K"]
 
 
 def test_empty_discard_draws_when_the_hand_is_not_showable():

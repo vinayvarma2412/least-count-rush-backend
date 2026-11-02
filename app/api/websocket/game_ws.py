@@ -71,6 +71,12 @@ async def start_game_for_room(room_id: str, eliminated_indices: Optional[list[in
         "eliminated_indices": eliminated_indices or [],
         "initial_turn_override": initial_turn_override,
     })
+    # Continuation rounds pass eliminated_indices (a list, possibly empty).
+    # A brand-new deal passes None and may drop a finished tournament board.
+    if eliminated_indices is None:
+        from app.api.routes.games import clear_tournament_scores, should_reset_scores_for_new_deal
+        if should_reset_scores_for_new_deal(room_id):
+            clear_tournament_scores(room_id)
     game_state = await game_service.initialize_game(room_id, eliminated_indices=eliminated_indices, initial_turn_override=initial_turn_override)
     if not game_state:
         log.error("game_init_failed", {"reason": "initialize_game_returned_none"})
@@ -629,6 +635,13 @@ async def handle_exit_game(websocket: WebSocket, room_id: str, data: Dict):
     else:
         # Just broadcast game update so everyone sees them marked exited
         await broadcast_game_update(room_id)
+
+    # Re-evaluate bot fill: if exactly one real player remains in a public
+    # room the bot countdown should start (or restart) now.
+    room = await room_service.get_room(room_id)
+    if room:
+        from app.services.bot_fill_service import sync_room_safely
+        await sync_room_safely(room)
 
 
 async def broadcast_game_update(room_id: str, picked_card: Dict = None):
