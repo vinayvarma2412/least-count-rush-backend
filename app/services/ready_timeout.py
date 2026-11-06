@@ -15,6 +15,7 @@ from app.config import PUBLIC_MATCHMAKE_EXCLUDE_SECONDS, PUBLIC_READY_TIMEOUT_SE
 from app.schemas.room import RoomStatus, RoomType
 
 READY_DEADLINE_FIELD = "ready_deadline_at"
+READY_TIMEOUT_INDEX = "rooms:ready_timeout_index"
 READY_TIMEOUT_REASON = "ready_timeout"
 READY_TIMEOUT_MESSAGE = (
     "You were removed because you did not tap Ready in time."
@@ -87,22 +88,48 @@ def apply_ready_deadlines(
                 new_player[READY_DEADLINE_FIELD] = deadline.isoformat()
                 changed = True
             elif current and not clock_running:
-                new_player[READY_DEADLINE_FIELD] = None
-                changed = True
+                # An expired deadline has to stay until the player is removed.
+                # Clearing it here made the countdown finish with nobody kicked.
+                deadline = _as_utc(current)
+                owes_ready = (
+                    deadline is not None
+                    and now >= deadline
+                    and not player.get("is_ready")
+                    and not player.get("is_exited")
+                )
+                if not owes_ready:
+                    new_player[READY_DEADLINE_FIELD] = None
+                    changed = True
             updated.append(new_player)
         room[key] = updated
     return changed
 
 
+def has_outstanding_ready_deadline(players: list) -> bool:
+    """True when a seated player still has a ready deadline and is not ready."""
+    for player in players:
+        if player.get("is_ready") or player.get("is_exited"):
+            continue
+        if player.get(READY_DEADLINE_FIELD):
+            return True
+    return False
+
+
 def expired_unready_player_ids(players: list, now: datetime) -> list[str]:
-    """Connected, unready players whose ready deadline has passed."""
+    """Unready players whose ready deadline has passed.
+
+    Disconnecting does not restart the clock, so a player who is offline when
+    the countdown ends is removed too. Leaving them in the room made the
+    countdown hit zero with the seat still taken.
+    """
     expired: list[str] = []
     for player in players:
-        if player.get("is_ready") or not player.get("is_connected") or player.get("is_exited"):
+        if player.get("is_ready") or player.get("is_exited"):
             continue
         deadline = _as_utc(player.get(READY_DEADLINE_FIELD))
-        if deadline is not None and now >= deadline:
-            expired.append(player["player_id"])
+        player_id = player.get("player_id")
+        if player_id and deadline is not None and now >= deadline:
+            expired.append(player_id)
     return expired
 
 
@@ -124,3 +151,31 @@ def matchmaking_block_reason(
 
 def exclude_ttl_seconds() -> int:
     return PUBLIC_MATCHMAKE_EXCLUDE_SECONDS
+
+
+def _is_offline(player: dict) -> bool:
+    """A disconnect stamp means offline, even if the socket flag was left on."""
+    if player.get("disconnect_at"):
+        return True
+    return not player.get("is_connected")
+
+
+def offline_bot_ids(players: list, bot_ids: set) -> list[str]:
+    """Bots to drop as soon as they are offline.
+
+    A connected bot with no disconnect stamp stays. Humans are not included.
+    Exited players are already out of the seat.
+    """
+    known = set(bot_ids or [])
+    offline_ids: list[str] = []
+    for player in players:
+        if player.get("is_exited"):
+            continue
+        player_id = player.get("player_id") or ""
+        if player_id not in known and not player.get("is_bot"):
+            continue
+        if not _is_offline(player):
+            continue
+        if player_id:
+            offline_ids.append(player_id)
+    return offline_ids
