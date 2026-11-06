@@ -643,6 +643,7 @@ class RoomService:
             pipe.delete(self._code_key(room_code))
         pipe.srem("rooms:index", room_id)
         pipe.srem("rooms:public_index", room_id)  # safe no-op for private rooms
+        pipe.srem("rooms:ready_timeout_index", room_id)
         await pipe.execute()
 
         return True
@@ -661,7 +662,29 @@ class RoomService:
         changed = apply_ready_deadlines(room, now or datetime.now(timezone.utc))
         if changed:
             await self._save_room(room)
+        await self._sync_ready_timeout_index(room)
         return changed
+
+    async def _sync_ready_timeout_index(self, room: dict) -> None:
+        """Keep rooms with a running ready deadline visible to the timeout loop.
+
+        A full public room is removed from rooms:public_index, and that used
+        to be the only set the timeout loop scanned. The countdown could then
+        reach zero with the unready player still seated.
+        """
+        from app.services.ready_timeout import (
+            READY_TIMEOUT_INDEX,
+            has_outstanding_ready_deadline,
+        )
+
+        room_id = room.get("room_id")
+        if not room_id:
+            return
+        people = list(room.get("players") or []) + list(room.get("waiting_players") or [])
+        if has_outstanding_ready_deadline(people):
+            await redis_client.sadd(READY_TIMEOUT_INDEX, room_id)
+        else:
+            await redis_client.srem(READY_TIMEOUT_INDEX, room_id)
 
     async def note_public_lobby_leave(self, room_id: str, player_id: str) -> None:
         """Remember this public waiting room so matchmaking will not return it."""

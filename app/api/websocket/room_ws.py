@@ -83,13 +83,32 @@ async def _empty_room_timeout(room_id: str):
                     _connection_status_tasks.pop(room_id, None)
                 from app.services.room_service import room_service
                 await room_service.delete_room(room_id)
+                from app.services.bot_fill_service import clear_room_safely
+                await clear_room_safely(room_id)
     except asyncio.CancelledError:
         pass
+    finally:
+        current = _empty_room_timers.get(room_id)
+        if current is asyncio.current_task():
+            _empty_room_timers.pop(room_id, None)
+
+def _ensure_empty_room_timer(room_id: str):
+    """Start the empty-room timer unless one is already running.
+
+    A finished timer used to stay in the map, so the next time the room
+    emptied the new timer was skipped and the room was never deleted.
+    """
+    existing = _empty_room_timers.get(room_id)
+    if existing is not None and not existing.done():
+        return
+    _empty_room_timers[room_id] = asyncio.create_task(_empty_room_timeout(room_id))
 
 def start_empty_room_timer(room_id: str):
-    if room_id in _empty_room_timers:
-        _empty_room_timers[room_id].cancel()
-    _empty_room_timers[room_id] = asyncio.create_task(_empty_room_timeout(room_id))
+    existing = _empty_room_timers.get(room_id)
+    if existing is not None and not existing.done():
+        existing.cancel()
+        _empty_room_timers.pop(room_id, None)
+    _ensure_empty_room_timer(room_id)
 
 # Maximum seconds allowed between pings before the connection is declared dead.
 # Flutter client sends a ping every 30 s; allow 2 missed pings + 10 s buffer → 70 s.
@@ -155,17 +174,36 @@ async def on_player_disconnect(room_id: str, player_id: str, websocket=None, con
         await room_service.set_player_disconnected_at(
             room_id, player_id, datetime.now(timezone.utc)
         )
+        # A bot that just went offline is removed now. Waiting for the lobby
+        # timer left it seated, and a playing room never reached that timer.
+        room_is_public = bool(
+            room and getattr(room.room_type, "value", room.room_type) == "public"
+        )
+        if room_is_public:
+            from app.services.ready_timeout_service import evict_lone_offline_bots
+            if await evict_lone_offline_bots(room_id):
+                if await room_service.get_room(room_id) is None:
+                    return
 
         if not await room_service.has_connected_players(room_id):
             get_room_logger(room_id).info("room_all_players_disconnected", {
                 "player_id": player_id,
             })
 
-        # Remove player from room if they stay offline while in WAITING or FINISHED state
-        if room and room.status in (RoomStatus.WAITING, RoomStatus.FINISHED):
+        # Remove a player who stays offline in the lobby, and drop a public
+        # room whose only remaining players are offline bots. The bot check
+        # also runs after a disconnect during a game: that bot never got a
+        # lobby removal timer, so it used to sit in the room forever.
+        room_is_public = bool(
+            room and getattr(room.room_type, "value", room.room_type) == "public"
+        )
+        if room and (room.status in (RoomStatus.WAITING, RoomStatus.FINISHED) or room_is_public):
             async def _delayed_remove(r_id, p_id):
                 await asyncio.sleep(30)  # Wait 30 seconds for reconnect
                 async with get_room_lock(r_id):
+                    from app.services.ready_timeout_service import evict_lone_offline_bots
+                    if await evict_lone_offline_bots(r_id):
+                        return
                     current_r = await room_service.get_room(r_id)
                     if not current_r or current_r.status not in (RoomStatus.WAITING, RoomStatus.FINISHED):
                         return
@@ -174,6 +212,8 @@ async def on_player_disconnect(room_id: str, player_id: str, websocket=None, con
                         get_room_logger(r_id).info("waiting_room_delayed_player_removal", {"player_id": p_id})
                         removed = await room_service.force_remove_player(r_id, p_id)
                         if removed:
+                            if await evict_lone_offline_bots(r_id):
+                                return
                             updated_r = await room_service.get_room(r_id)
                             if updated_r:
                                 await manager.broadcast_to_room({
@@ -432,6 +472,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = ""
                 await game_ws.handle_exit_game(websocket, room_id, data)
             elif message_type == "player_ready":
                 await handle_player_ready(websocket, room_id, data)
+            elif message_type == "ready_timeout_check":
+                await handle_ready_timeout_check(websocket, room_id, data)
             elif message_type == "remove_player":
                 await handle_remove_player(websocket, room_id, data)
             elif message_type == "set_in_game":
@@ -522,6 +564,15 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = ""
                 pass
 
 
+async def _remember_bot(room_id: str, player_id: str) -> None:
+    """Stamp is_bot on the seat so a later disconnect can drop the bot without a lookup."""
+    from app.services.bot_fill_service import _bot_player_ids
+
+    bot_ids = await _bot_player_ids([player_id])
+    if bot_ids and player_id in bot_ids:
+        await room_service.update_player_fields(room_id, player_id, is_bot=True)
+
+
 @with_room_lock
 async def handle_join_room(websocket: WebSocket, room_id: str, data: Dict):
     """Handle join room message"""
@@ -551,6 +602,7 @@ async def handle_join_room(websocket: WebSocket, room_id: str, data: Dict):
         if success:
             # Force is_connected=True if needed
             await room_service.update_player_fields(room_id, player_id, is_connected=True, connection_id=connection_id)
+            await _remember_bot(room_id, player_id)
     else:
         # Player already in room — reconnecting
         connected_result = await room_service.set_player_connected(room_id, player_id, True)
@@ -565,6 +617,7 @@ async def handle_join_room(websocket: WebSocket, room_id: str, data: Dict):
 
         # Force is_connected=True if still not set
         await room_service.update_player_fields(room_id, player_id, is_connected=True, connection_id=connection_id)
+        await _remember_bot(room_id, player_id)
 
         log.info("player_reconnected", {
             "player_id": player_id,
@@ -699,8 +752,7 @@ async def _handle_leave_room_internal(websocket: WebSocket, room_id: str, silent
                 "last_player_id": player_id,
             })
             # Start a 5-minute timer to delete the room if no one rejoins
-            if room_id not in _empty_room_timers:
-                _empty_room_timers[room_id] = asyncio.create_task(_empty_room_timeout(room_id))
+            _ensure_empty_room_timer(room_id)
             from app.services.bot_fill_service import clear_room_safely
             await clear_room_safely(room_id)
             return
@@ -751,8 +803,12 @@ async def handle_player_ready(websocket: WebSocket, room_id: str, data: Dict):
     success = await room_service.set_player_ready(room_id, player_id, is_ready)
 
     if success:
+        from app.services.ready_timeout_service import kick_expired_ready_players
+        await kick_expired_ready_players(room_id)
         await room_service.refresh_public_ready_deadlines(room_id)
         room = await room_service.get_room(room_id)
+        if not room:
+            return
         is_public = room.room_type.value == "public"
         
         # Debug printing
@@ -807,6 +863,27 @@ async def handle_player_ready(websocket: WebSocket, room_id: str, data: Dict):
             "type": "error",
             "message": "Failed to update ready status"
         }, websocket)
+
+
+@with_room_lock
+async def handle_ready_timeout_check(websocket: WebSocket, room_id: str, data: Dict):
+    """Remove unready players whose ready countdown has finished.
+
+    The lobby sends this when its clock reaches zero. The background sweep
+    can miss a full room, and a removal on another server is not pushed to
+    the sockets connected here, so the clients otherwise stay on the old list.
+    """
+    from app.services.ready_timeout_service import kick_expired_ready_players
+
+    await kick_expired_ready_players(room_id)
+    await room_service.refresh_public_ready_deadlines(room_id)
+    room = await room_service.get_room(room_id)
+    if not room:
+        return
+    await manager.broadcast_to_room({
+        "type": "room_update",
+        "data": room.model_dump(mode="json"),
+    }, room_id)
 
 
 # Action types that must NOT be relayed to opponents.
@@ -1031,6 +1108,29 @@ async def handle_update_room_status_to_waiting(websocket: WebSocket, room_id: st
     await room_service.reset_exited_players(room_id)
     await room_service.reset_all_players_ready(room_id)
 
+    # Remove any bots that were seated from the previous game so the new lobby
+    # starts clean.  Bots that remain seated will immediately mark themselves
+    # ready again (they react to the room_update with status=waiting), which
+    # falsely satisfies the "all players ready" check on the client and kicks
+    # the human into a countdown they never agreed to start.
+    # The bot-fill service will re-add exactly one bot after the configured
+    # wait if the human is still alone.
+    room_after_reset = await room_service.get_room(room_id)
+    if room_after_reset:
+        from app.services.bot_fill_service import _bot_player_ids
+        all_pids = [p.player_id for p in room_after_reset.players + room_after_reset.waiting_players]
+        bot_ids = await _bot_player_ids(all_pids) or set()
+        for bot_pid in list(bot_ids):
+            removed = await room_service.force_remove_player(room_id, bot_pid)
+            if removed:
+                log.info("play_again_bot_removed", {
+                    "bot_player_id": bot_pid,
+                    "requested_by": player_id,
+                })
+        # Also clear the bot-fill timer so it restarts cleanly from zero
+        from app.services.bot_fill_service import clear_room_safely
+        await clear_room_safely(room_id)
+
     log.info("room_status_reset_to_waiting", {
         "requested_by": player_id,
     })
@@ -1041,6 +1141,11 @@ async def handle_update_room_status_to_waiting(websocket: WebSocket, room_id: st
             "type": "room_update",
             "data": updated_room.model_dump(mode='json')
         }, room_id)
+
+        # Re-sync bot-fill so the timer starts immediately now that the room
+        # is back to waiting with only real players.
+        from app.services.bot_fill_service import sync_room_safely
+        await sync_room_safely(updated_room)
 
 
 @with_room_lock
