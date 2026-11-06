@@ -1,10 +1,10 @@
-# fly.toml app configuration file generated for leastcountrush on 2026-08-09T18:36:49Z
+# fly.toml app configuration file generated for leastcountrush-lax on 2026-11-06T13:10:30Z
 #
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+# See https://docs.fly.io/reference/configuration for information about how to use this file.
 #
 
 app = "leastcountrush-lax"
-primary_region = "lax"
+primary_region = 'lax'
 
 [http_service]
 auto_start_machines = true
