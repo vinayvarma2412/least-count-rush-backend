@@ -21,6 +21,14 @@ def _all_players(room: dict) -> list:
     return list(room.get("players") or []) + list(room.get("waiting_players") or [])
 
 
+def paginate_rooms(rooms: list, *, limit: int, offset: int) -> tuple[list, int]:
+    """Return one page and the total count. ``offset`` past the end yields an empty page."""
+    total = len(rooms)
+    if offset >= total:
+        return [], total
+    return rooms[offset:offset + limit], total
+
+
 def is_open_random_room(room: dict, now: datetime, exclude_room_ids=None) -> bool:
     """A waiting public room with a free seat.
 

@@ -170,9 +170,15 @@ class RoomService:
     async def list_open_random_rooms(
         self,
         exclude_room_ids: Optional[Set[str]] = None,
-    ) -> List[RoomResponse]:
-        """Public waiting rooms with a free seat, including rooms players have left."""
-        from app.services.random_room_listing import is_open_random_room
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[List[RoomResponse], int]:
+        """One page of public waiting rooms with a free seat.
+
+        Rooms are filtered and sorted first, then sliced. ``total`` is the
+        full open-room count, not the page length.
+        """
+        from app.services.random_room_listing import is_open_random_room, paginate_rooms
 
         now = datetime.now(timezone.utc)
         exclude_room_ids = exclude_room_ids or set()
@@ -186,8 +192,8 @@ class RoomService:
                 continue
             if is_open_random_room(room, now, exclude_room_ids):
                 rooms.append(RoomResponse(**room))
-        rooms.sort(key=lambda room: room.created_at)
-        return rooms
+        rooms.sort(key=lambda room: (room.created_at, room.room_id))
+        return paginate_rooms(rooms, limit=limit, offset=offset)
 
     async def list_rooms(self, status: Optional[RoomStatus] = None) -> List[RoomResponse]:
         """List all rooms, optionally filtered by status."""

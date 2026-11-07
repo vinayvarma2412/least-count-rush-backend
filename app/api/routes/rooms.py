@@ -115,12 +115,18 @@ async def create_room(room_data: RoomCreate, user: dict = Depends(get_current_fi
 
 @router.get("/public/open", response_model=RoomListResponse)
 async def list_open_random_rooms(
+    limit: int = Query(20, ge=1, le=50),
+    offset: int = Query(0, ge=0),
     user: dict = Depends(get_current_firebase_user),
 ):
-    """Waiting public rooms a Play with Randoms player can join."""
+    """One page of waiting public rooms a Play with Randoms player can join.
+
+    ``total`` is the number of open rooms, so the client can request the next
+    page with a larger ``offset``.
+    """
     del user
-    rooms = await room_service.list_open_random_rooms()
-    return RoomListResponse(rooms=rooms, total=len(rooms))
+    rooms, total = await room_service.list_open_random_rooms(limit=limit, offset=offset)
+    return RoomListResponse(rooms=rooms, total=total)
 
 
 @router.get("/public/stats", response_model=PublicRoomStatsResponse)
