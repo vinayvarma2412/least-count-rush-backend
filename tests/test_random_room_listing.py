@@ -1,7 +1,7 @@
 """Random Rooms list includes only open public lobbies."""
 from datetime import datetime, timedelta, timezone
 
-from app.services.random_room_listing import is_open_random_room
+from app.services.random_room_listing import is_open_random_room, paginate_rooms
 
 NOW = datetime(2026, 10, 31, tzinfo=timezone.utc)
 
@@ -54,6 +54,19 @@ def test_lists_a_room_after_players_leave():
         NOW,
     ) is True
     assert is_open_random_room(_room(), NOW, {"room-1"}) is True
+
+
+def test_paginate_rooms_returns_a_page_and_the_full_total():
+    rooms = ["a", "b", "c", "d", "e"]
+    page, total = paginate_rooms(rooms, limit=2, offset=2)
+    assert page == ["c", "d"]
+    assert total == 5
+
+
+def test_paginate_rooms_returns_an_empty_page_past_the_end():
+    page, total = paginate_rooms(["a", "b"], limit=20, offset=2)
+    assert page == []
+    assert total == 2
 
 
 def test_hides_a_room_with_an_expired_ready_deadline():
