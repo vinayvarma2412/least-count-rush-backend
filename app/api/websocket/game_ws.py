@@ -592,8 +592,14 @@ async def handle_exit_game(websocket: WebSocket, room_id: str, data: Dict):
     if player_index is None:
         return
 
-    # Set player exited
+    # Set player exited. If they were admin, the role moves to the next active player.
     await room_service.set_player_exited(room_id, player_id, True)
+    updated_room = await room_service.get_room(room_id)
+    if updated_room:
+        await manager.broadcast_to_room({
+            "type": "room_update",
+            "data": updated_room.model_dump(mode="json"),
+        }, room_id)
 
     # Clean up turn context if it's their turn
     gs = await game_service.get_game_state(room_id)
