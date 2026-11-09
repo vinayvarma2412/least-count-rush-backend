@@ -18,6 +18,7 @@ from app.utils.room_logger import get_room_logger, global_log
 from app.utils.firebase_auth import verify_firebase_token
 from app.utils.debug_log import log_to_file
 from app.services.redis_client import KEY_TTL_SECONDS, redis_client
+from app.services.server_switch import HANDOFF_GRACE_SECONDS, SWITCHING, handoff_kind
 
 # Track running connection status check tasks per room
 _connection_status_tasks: Dict[str, asyncio.Task] = {}
@@ -33,6 +34,10 @@ _room_latency_reports: Dict[str, Dict[str, Dict[str, int]]] = {} # room_id -> {p
 _server_selection_tasks: Dict[str, asyncio.Task] = {}
 _server_switch_ack_locks: Dict[str, asyncio.Lock] = {}
 _SERVER_SELECTION_REPORT_TIMEOUT_SECONDS = 10
+# Silent closes that belong to a best-server move. The disconnect callback
+# must not mark that seat offline.
+_handoff_sockets: set[int] = set()
+_handoff_watches: Dict[tuple, asyncio.Task] = {}
 
 
 async def _server_selection_urls() -> list[str]:
@@ -66,6 +71,81 @@ async def _server_selection_urls() -> list[str]:
 
 def _server_selection_key(room_id: str) -> str:
     return f"rooms:server_selection:{room_id}"
+
+
+def _cancel_handoff_watches(room_id: str, player_id: str) -> None:
+    """Drop a pending handoff expiry once this player has a new socket."""
+    for key, task in list(_handoff_watches.items()):
+        if key[0] == room_id and key[1] == player_id and not task.done():
+            task.cancel()
+
+
+def _schedule_handoff_watch(room_id: str, player_id: str, connection_id: str) -> None:
+    key = (room_id, player_id, connection_id)
+    existing = _handoff_watches.get(key)
+    if existing is not None and not existing.done():
+        return
+    _handoff_watches[key] = asyncio.create_task(
+        _expire_unfinished_handoff(room_id, player_id, connection_id)
+    )
+
+
+async def _expire_unfinished_handoff(room_id: str, player_id: str, connection_id: str) -> None:
+    """Mark the seat offline only if the selected server never received a join."""
+    try:
+        await asyncio.sleep(HANDOFF_GRACE_SECONDS)
+        async with get_room_lock(room_id):
+            room = await room_service.get_room(room_id)
+            if not room:
+                return
+            people = list(room.players) + list(room.waiting_players)
+            player = next((p for p in people if p.player_id == player_id), None)
+            if player is None or player.connection_id != connection_id:
+                return
+            was_admin = bool(player.is_admin)
+            await room_service.set_player_connected(room_id, player_id, False)
+            if was_admin:
+                await room_service.transfer_admin(room_id, player_id)
+            await room_service.set_player_disconnected_at(
+                room_id, player_id, datetime.now(timezone.utc)
+            )
+            room_is_public = getattr(room.room_type, "value", room.room_type) == "public"
+            if room_is_public:
+                from app.services.ready_timeout_service import evict_lone_offline_bots
+                await evict_lone_offline_bots(room_id)
+            updated = await room_service.get_room(room_id)
+            if updated:
+                await manager.broadcast_to_room({
+                    "type": "room_update",
+                    "data": updated.model_dump(mode="json"),
+                }, room_id)
+            get_room_logger(room_id).info("server_handoff_expired", {
+                "player_id": player_id,
+            })
+    except asyncio.CancelledError:
+        pass
+    finally:
+        current = _handoff_watches.get((room_id, player_id, connection_id))
+        if current is asyncio.current_task():
+            _handoff_watches.pop((room_id, player_id, connection_id), None)
+
+
+async def _lookup_handoff_kind(room_id: str, player_id: str, connection_id: str | None) -> str | None:
+    current_connection_id = None
+    room = await room_service.get_room(room_id)
+    if room:
+        people = list(room.players) + list(room.waiting_players)
+        player = next((p for p in people if p.player_id == player_id), None)
+        if player is not None:
+            current_connection_id = player.connection_id
+    raw_state = await redis_client.get(_server_selection_key(room_id))
+    selection_state = None
+    if raw_state:
+        try:
+            selection_state = json.loads(raw_state)
+        except (TypeError, json.JSONDecodeError):
+            selection_state = None
+    return handoff_kind(player_id, connection_id, current_connection_id, selection_state)
 
 # Empty room deletion timers
 _empty_room_timers: Dict[str, asyncio.Task] = {}
@@ -138,6 +218,13 @@ async def _broadcast_room_update_on_disconnect(room_id: str):
 @with_room_lock
 async def on_player_disconnect(room_id: str, player_id: str, websocket=None, connection_id=None):
     """Callback when a player disconnects from connection manager."""
+    if websocket is not None and id(websocket) in _handoff_sockets:
+        _handoff_sockets.discard(id(websocket))
+        get_room_logger(room_id).info("player_disconnect_ignored_server_switch", {
+            "player_id": player_id,
+        })
+        return
+
     if player_id:
         # 1. Check if the player has any OTHER active connections on THIS server
         active_connections = manager.get_room_connections(room_id)
@@ -155,6 +242,7 @@ async def on_player_disconnect(room_id: str, player_id: str, websocket=None, con
         # 2. Check if a newer connection for this player has been established globally (e.g. on another server)
         # by checking if the connection_id in Redis matches the one that just disconnected.
         room = await room_service.get_room(room_id)
+        p = None
         if room:
             p = next((x for x in room.players + room.waiting_players if x.player_id == player_id), None)
             if p:
@@ -167,7 +255,10 @@ async def on_player_disconnect(room_id: str, player_id: str, websocket=None, con
                     })
                     return
 
+        was_admin = bool(p and getattr(p, "is_admin", False))
         await room_service.set_player_connected(room_id, player_id, False)
+        if was_admin:
+            await room_service.transfer_admin(room_id, player_id)
         await room_service.note_public_lobby_leave(room_id, player_id)
         await room_service.refresh_public_ready_deadlines(room_id)
         # Record disconnect timestamp for countdown badge
@@ -603,6 +694,8 @@ async def handle_join_room(websocket: WebSocket, room_id: str, data: Dict):
             # Force is_connected=True if needed
             await room_service.update_player_fields(room_id, player_id, is_connected=True, connection_id=connection_id)
             await _remember_bot(room_id, player_id)
+            if await room_service.get_player_field(room_id, player_id, "is_bot"):
+                await room_service.transfer_admin(room_id, player_id)
     else:
         # Player already in room — reconnecting
         connected_result = await room_service.set_player_connected(room_id, player_id, True)
@@ -618,6 +711,8 @@ async def handle_join_room(websocket: WebSocket, room_id: str, data: Dict):
         # Force is_connected=True if still not set
         await room_service.update_player_fields(room_id, player_id, is_connected=True, connection_id=connection_id)
         await _remember_bot(room_id, player_id)
+        if await room_service.get_player_field(room_id, player_id, "is_bot"):
+            await room_service.transfer_admin(room_id, player_id)
 
         log.info("player_reconnected", {
             "player_id": player_id,
@@ -658,6 +753,7 @@ async def handle_join_room(websocket: WebSocket, room_id: str, data: Dict):
 
     if success:
         log_to_file("handle_join_room: success is True, getting room")
+        _cancel_handoff_watches(room_id, player_id)
         await room_service.refresh_public_ready_deadlines(room_id)
         room = await room_service.get_room(room_id)
         
@@ -725,6 +821,7 @@ async def _handle_leave_room_internal(websocket: WebSocket, room_id: str, silent
     """Internal leave room logic without lock"""
     log = get_room_logger(room_id)
     player_id = manager.get_player_id(websocket)
+    closing_connection_id = manager.connection_ids.get(websocket)
 
     was_admin = False
     if player_id:
@@ -734,7 +831,26 @@ async def _handle_leave_room_internal(websocket: WebSocket, room_id: str, silent
             if player and player.is_admin:
                 was_admin = True
 
+    # A best-server move closes the old socket before the new join lands, and
+    # the phone can finish joining before this close is processed. Neither
+    # case is a leave: marking the seat offline here deleted the bot and left
+    # the player inactive.
+    handoff = None
+    if silent and player_id:
+        handoff = await _lookup_handoff_kind(room_id, player_id, closing_connection_id)
+    if handoff:
+        _handoff_sockets.add(id(websocket))
+
     manager.disconnect(websocket)
+
+    if handoff:
+        if handoff == SWITCHING and closing_connection_id:
+            _schedule_handoff_watch(room_id, player_id, closing_connection_id)
+        log.info("leave_ignored_server_switch", {
+            "player_id": player_id,
+            "handoff": handoff,
+        })
+        return
 
     if player_id:
         await room_service.set_player_connected(room_id, player_id, False)

@@ -70,6 +70,9 @@ update_api_config() {
     fi
 }
 
+# A port passed on the command line (PORT=8000 ./run.sh) must win over .env.
+REQUESTED_PORT="${PORT-}"
+
 # Load only simple script-needed keys. Do NOT `export $(xargs)` the whole
 # file — PEM keys and JSON credentials contain spaces/newlines and get split
 # into invalid `export` identifiers. pydantic/dotenv still reads .env for IAP.
@@ -81,6 +84,9 @@ if [ -f ".env" ]; then
         key="${line%%=*}"
         case "$key" in
             PORT|LOG_LEVEL|REDIS_URL|DATABASE_URL|PUBLIC_SERVER_URL)
+                if [ "$key" = "PORT" ] && [ -n "$REQUESTED_PORT" ]; then
+                    continue
+                fi
                 value="${line#*=}"
                 value="${value%$'\r'}"
                 if [[ "$value" == \"*\" ]]; then
@@ -174,4 +180,13 @@ fi
 # Run the FastAPI server
 LOG_LEVEL_LOWER=$(echo "${LOG_LEVEL:-info}" | tr '[:upper:]' '[:lower:]')
 PORT=${PORT:-8000}
-"$UVICORN_CMD" app.main:app --reload --host 0.0.0.0 --port "$PORT" --log-level "$LOG_LEVEL_LOWER"
+export PORT
+# Rooms are stamped with PUBLIC_SERVER_URL. .env is shared by every local
+# process, so a server started second used to keep the other port and the
+# app followed that stamp off the server it had just called.
+server_ip=$(get_network_ip)
+if [ -n "$server_ip" ]; then
+    export PUBLIC_SERVER_URL="http://${server_ip}:${PORT}"
+    echo "Advertising this server as $PUBLIC_SERVER_URL"
+fi
+"$UVICORN_CMD" app.main:app --host 0.0.0.0 --port "$PORT" --log-level "$LOG_LEVEL_LOWER"

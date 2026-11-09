@@ -31,6 +31,95 @@ def _room_to_json(room: dict) -> str:
     return json.dumps(room, default=default)
 
 
+def _eligible_admin(player: dict) -> bool:
+    """Humans still seated can hold admin. Bots and exited players cannot."""
+    return not player.get("is_exited") and not player.get("is_bot")
+
+
+def _is_active_admin(player: dict) -> bool:
+    return (
+        bool(player.get("is_admin"))
+        and bool(player.get("is_connected"))
+        and _eligible_admin(player)
+    )
+
+
+def seated_players(room: dict) -> list:
+    return list(room.get("players") or []) + list(room.get("waiting_players") or [])
+
+
+def newcomer_claims_admin(existing: list) -> bool:
+    """The joining player becomes admin when nobody active already holds it.
+
+    Applies to every room type. An offline or exited admin does not block this,
+    and their flag is cleared so the room never has two admins.
+    """
+    if any(_is_active_admin(player) for player in existing):
+        return False
+    for player in existing:
+        player["is_admin"] = False
+    return True
+
+
+def select_next_admin_id(players: list, old_admin_id: Optional[str]) -> Optional[str]:
+    """Next seated human after the outgoing admin, wrapping around the table.
+
+    Prefers a connected player. If nobody else is connected, the next human
+    who is still seated gets it. The outgoing admin keeps the role only when
+    they are the only eligible human left.
+    """
+    if not players:
+        return None
+    start = 0
+    if old_admin_id:
+        for index, player in enumerate(players):
+            if player.get("player_id") == old_admin_id:
+                start = index + 1
+                break
+    ordered = players[start:] + players[:start]
+
+    def pick(require_connected: bool) -> Optional[str]:
+        for player in ordered:
+            if old_admin_id and player.get("player_id") == old_admin_id:
+                continue
+            if not _eligible_admin(player):
+                continue
+            if require_connected and not player.get("is_connected"):
+                continue
+            return player.get("player_id")
+        return None
+
+    chosen = pick(require_connected=True)
+    if chosen:
+        return chosen
+    chosen = pick(require_connected=False)
+    if chosen:
+        return chosen
+    for player in players:
+        if player.get("player_id") == old_admin_id and _eligible_admin(player):
+            return old_admin_id
+    return None
+
+
+def apply_admin_transfer(room: dict, old_admin_id: Optional[str]) -> tuple[Optional[str], bool]:
+    """Move admin off old_admin_id. Returns (admin_id, changed).
+
+    A second call after the role has already moved does not change anyone.
+    Room type is ignored: public and private rooms share this rule.
+    """
+    people = seated_players(room)
+    if old_admin_id:
+        outgoing = next((player for player in people if player.get("player_id") == old_admin_id), None)
+        if outgoing is not None and not outgoing.get("is_admin"):
+            current = next((player.get("player_id") for player in people if player.get("is_admin")), None)
+            return current, False
+
+    chosen = select_next_admin_id(people, old_admin_id)
+    for player in people:
+        player["is_admin"] = bool(chosen) and player.get("player_id") == chosen
+    return chosen, True
+
+
 def _room_from_json(raw: str) -> dict:
     """Deserialise a room dict from JSON, reconstructing datetime fields."""
     room = json.loads(raw)
@@ -237,10 +326,9 @@ class RoomService:
         if any(p["player_id"] == player_id for p in room["players"]):
             return False
 
-        if len(room["players"]) == 0 and len(room.get("waiting_players", [])) == 0:
-            is_public = room.get("room_type") in (RoomType.PUBLIC, RoomType.PUBLIC.value, "public")
-            if not is_public:
-                is_admin = True
+        existing = room["players"] + room.get("waiting_players", [])
+        if newcomer_claims_admin(existing):
+            is_admin = True
 
         player = {
             "player_id": player_id,
@@ -285,7 +373,10 @@ class RoomService:
 
         log = get_room_logger(room_id)
 
-        admin_player = next((p for p in room["players"] if p["player_id"] == admin_player_id), None)
+        admin_player = next(
+            (p for p in room["players"] + room.get("waiting_players", []) if p["player_id"] == admin_player_id),
+            None,
+        )
         if not admin_player or not admin_player.get("is_admin", False):
             log.warn("player_remove_rejected", {
                 "target_player_id": target_player_id,
@@ -363,6 +454,9 @@ class RoomService:
             await self.delete_room(room_id)
             return True
 
+        if target_player.get("is_admin"):
+            apply_admin_transfer(room, target_player_id)
+
         log.info("player_force_removed", {
             "target_player_id": target_player_id,
             "target_player_name": target_player.get("player_name"),
@@ -375,53 +469,39 @@ class RoomService:
     async def transfer_admin(self, room_id: str, old_admin_id: Optional[str] = None) -> Optional[str]:
         """Transfer admin to the next active player when admin leaves."""
         room = await self._load_room(room_id)
-        if not room or not room["players"]:
+        if not room or not seated_players(room):
             return None
 
         log = get_room_logger(room_id)
-        
-        is_public = room.get("room_type") in (RoomType.PUBLIC, RoomType.PUBLIC.value, "public")
-        if is_public:
-            return None
+        chosen, changed = apply_admin_transfer(room, old_admin_id)
+        if not changed:
+            return chosen
 
-        for player in room["players"]:
-            player["is_admin"] = False
+        if chosen and chosen != old_admin_id:
+            chosen_player = next(
+                (player for player in seated_players(room) if player.get("player_id") == chosen),
+                {},
+            )
+            reason = "connected_player_found" if chosen_player.get("is_connected") else "fallback_no_connected_players"
+            log.info("admin_transferred", {
+                "from_player_id": old_admin_id,
+                "to_player_id": chosen,
+                "to_player_name": chosen_player.get("player_name"),
+                "reason": reason,
+            })
+        elif chosen == old_admin_id:
+            log.info("admin_retained", {
+                "player_id": old_admin_id,
+                "reason": "only_player_in_room",
+            })
+        else:
+            log.info("admin_cleared", {
+                "from_player_id": old_admin_id,
+                "reason": "no_eligible_player",
+            })
 
-        for player in room["players"]:
-            if player.get("player_id") != old_admin_id and player.get("is_connected", False):
-                player["is_admin"] = True
-                log.info("admin_transferred", {
-                    "from_player_id": old_admin_id,
-                    "to_player_id": player["player_id"],
-                    "to_player_name": player["player_name"],
-                    "reason": "connected_player_found",
-                })
-                await self._save_room(room)
-                return player["player_id"]
-
-        for player in room["players"]:
-            if player.get("player_id") != old_admin_id:
-                player["is_admin"] = True
-                log.info("admin_transferred", {
-                    "from_player_id": old_admin_id,
-                    "to_player_id": player["player_id"],
-                    "to_player_name": player["player_name"],
-                    "reason": "fallback_no_connected_players",
-                })
-                await self._save_room(room)
-                return player["player_id"]
-
-        for player in room["players"]:
-            if player.get("player_id") == old_admin_id:
-                player["is_admin"] = True
-                log.info("admin_retained", {
-                    "player_id": old_admin_id,
-                    "reason": "only_player_in_room",
-                })
-                await self._save_room(room)
-                return player["player_id"]
-
-        return None
+        await self._save_room(room)
+        return chosen
 
     async def set_player_ready(self, room_id: str, player_id: str, is_ready: bool) -> bool:
         """Set player ready status."""
@@ -507,8 +587,11 @@ class RoomService:
         all_players = room["players"] + room.get("waiting_players", [])
         for player in all_players:
             if player["player_id"] == player_id:
+                was_admin = bool(player.get("is_admin"))
                 player["is_exited"] = is_exited
                 player["exited_at"] = datetime.now(timezone.utc) if is_exited else None
+                if is_exited and was_admin:
+                    apply_admin_transfer(room, player_id)
                 get_room_logger(room_id).info("player_exited_status_changed", {
                     "player_id": player_id,
                     "player_name": player.get("player_name"),

@@ -176,6 +176,11 @@ async def _turn_timer_loop(room_id: str) -> None:
                             "player_id": exit_player_id,
                         },
                     }, room_id)
+                    if room_for_exit:
+                        await manager.broadcast_to_room({
+                            "type": "room_update",
+                            "data": room_for_exit.model_dump(mode="json"),
+                        }, room_id)
 
                     # Check active players AFTER set_player_exited is committed
                     active_players = await game_service.get_active_players(room_id)
