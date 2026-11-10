@@ -1,5 +1,11 @@
 """A best-server reconnect must not look like the player or the bot left."""
-from app.services.server_switch import REPLACED, SWITCHING, handoff_kind
+from app.services.server_switch import (
+    REPLACED,
+    SWITCHING,
+    handoff_kind,
+    parse_server_list,
+    selection_candidates,
+)
 
 
 def _selection(*player_ids, started=False):
@@ -31,6 +37,26 @@ def test_someone_outside_the_move_is_a_real_leave():
 
 def test_a_close_with_no_selection_is_a_real_leave():
     assert handoff_kind("alice", "socket-1", "socket-1", None) is None
+
+
+def test_a_json_server_list_keeps_absolute_urls():
+    raw = '[{"name": "SIN", "url": "https://a.example/"}, {"name": "USA", "url": "https://b.example"}]'
+    assert parse_server_list(raw) == ["https://a.example", "https://b.example"]
+
+
+def test_an_already_decoded_server_list_is_not_treated_as_missing():
+    assert parse_server_list([{"url": "http://10.0.0.8:8001"}]) == ["http://10.0.0.8:8001"]
+
+
+def test_a_missing_remote_list_still_includes_the_room_server():
+    assert selection_candidates([], "http://192.168.0.5:8001/") == ["http://192.168.0.5:8001"]
+
+
+def test_the_room_server_is_added_when_remote_config_lists_other_regions():
+    assert selection_candidates(
+        ["https://game.example"],
+        "http://192.168.0.5:8001",
+    ) == ["https://game.example", "http://192.168.0.5:8001"]
 
 
 def test_a_missing_player_is_not_a_handoff():
