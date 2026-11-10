@@ -18,7 +18,13 @@ from app.utils.room_logger import get_room_logger, global_log
 from app.utils.firebase_auth import verify_firebase_token
 from app.utils.debug_log import log_to_file
 from app.services.redis_client import KEY_TTL_SECONDS, redis_client
-from app.services.server_switch import HANDOFF_GRACE_SECONDS, SWITCHING, handoff_kind
+from app.services.server_switch import (
+    HANDOFF_GRACE_SECONDS,
+    SWITCHING,
+    handoff_kind,
+    parse_server_list,
+    selection_candidates,
+)
 
 # Track running connection status check tasks per room
 _connection_status_tasks: Dict[str, asyncio.Task] = {}
@@ -40,33 +46,37 @@ _handoff_sockets: set[int] = set()
 _handoff_watches: Dict[tuple, asyncio.Task] = {}
 
 
-async def _server_selection_urls() -> list[str]:
-    """Return the canonical server list configured by the backend from Firebase config.
-    """
+async def _remote_server_urls() -> list[str]:
+    """Server URLs from Firebase Remote Config, or an empty list if unreadable."""
     try:
         from app.services.remote_config_service import remote_config_service
         from app.config import settings
-        
+
         template, _ = await remote_config_service.get_template()
         key = "servers_list_dev" if settings.develop_mode else "servers_list"
-        configured = template.get("parameters", {}).get(key, {}).get("defaultValue", {}).get("value", "")
-        
-        if configured:
-            import json
-            values = json.loads(configured)
-            urls: list[str] = []
-            for value in values:
-                if isinstance(value, dict) and "url" in value:
-                    url = value["url"].strip().rstrip("/")
-                    if url.startswith(("http://", "https://")) and url not in urls:
-                        urls.append(url)
-            if urls:
-                return urls
+        parameters = template.get("parameters", {})
+        groups = template.get("parameterGroups", {})
+        spec = parameters.get(key)
+        if not isinstance(spec, dict):
+            for group in groups.values():
+                grouped = (group or {}).get("parameters", {}).get(key)
+                if isinstance(grouped, dict):
+                    spec = grouped
+                    break
+        if not isinstance(spec, dict):
+            return []
+        configured = (spec.get("defaultValue") or {}).get("value", "")
+        return parse_server_list(configured)
     except Exception as e:
-        from app.utils.room_logger import global_log
         global_log.error("server_selection_urls_fetch_failed", {"error": str(e)})
-        
-    return []
+        return []
+
+
+def _room_server_url(room) -> str:
+    current = getattr(room, "server_url", None) or ""
+    if isinstance(current, str) and current.strip():
+        return current.strip()
+    return os.getenv("PUBLIC_SERVER_URL") or ""
 
 
 def _server_selection_key(room_id: str) -> str:
@@ -1355,17 +1365,14 @@ async def _start_server_selection(room_id: str, room):
     log = get_room_logger(room_id)
     log.info("start_server_selection", {"room_id": room_id})
 
-    server_urls = await _server_selection_urls()
-    if not server_urls:
-        log.error("server_selection_no_servers_configured")
-        await manager.broadcast_to_room({
-            "type": "error",
-            "message": "No game servers are configured.",
-        }, room_id)
-        return
-
-    if len(server_urls) == 1:
-        log.info("server_selection_single_server_skipped", {"server_url": server_urls[0]})
+    server_urls = selection_candidates(await _remote_server_urls(), _room_server_url(room))
+    if len(server_urls) < 2:
+        # One server, or Remote Config had no list. Everyone is already on a
+        # server. An error toast here only interrupts Ready.
+        log.info("server_selection_skipped", {
+            "server_count": len(server_urls),
+            "servers": server_urls,
+        })
         return
 
     # We can only measure latency from players who are currently connected

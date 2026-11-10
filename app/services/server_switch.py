@@ -4,6 +4,7 @@ Ready starts a latency check, then everyone reconnects to the chosen server.
 The old socket closing during that move is not a leave. Treating it as one
 removed the bot from public rooms and left the phone inactive.
 """
+import json
 
 REPLACED = "replaced"
 SWITCHING = "switching"
@@ -11,6 +12,50 @@ SWITCHING = "switching"
 # Long enough for the phone to drop its socket, open the new one, and join.
 # The app waits about two seconds between those steps.
 HANDOFF_GRACE_SECONDS = 20
+
+
+def parse_server_list(configured) -> list[str]:
+    """Absolute URLs from a Remote Config ``servers_list`` value.
+
+    The value is usually a JSON string. A list that was already decoded is
+    accepted too, so a non-string payload is not treated as "list missing".
+    """
+    if configured is None or configured == "":
+        return []
+    values = configured
+    if isinstance(configured, str):
+        try:
+            values = json.loads(configured)
+        except json.JSONDecodeError:
+            return []
+    if isinstance(values, dict):
+        values = values.get("servers") or values.get("urls") or []
+    if not isinstance(values, list):
+        return []
+    urls: list[str] = []
+    for value in values:
+        raw = value.get("url") if isinstance(value, dict) else value
+        if not isinstance(raw, str):
+            continue
+        url = raw.strip().rstrip("/")
+        if url.startswith(("http://", "https://")) and url not in urls:
+            urls.append(url)
+    return urls
+
+
+def selection_candidates(configured_urls: list[str], current_server_url: str | None) -> list[str]:
+    """Servers to measure, always including the one this room is already on.
+
+    Remote Config can be missing, or it can list other regions only. The
+    room's own URL stays in the set so Ready does not report that the
+    selection list was not found and does not leave a reachable server behind.
+    """
+    urls: list[str] = []
+    for url in [*configured_urls, current_server_url or ""]:
+        cleaned = url.strip().rstrip("/")
+        if cleaned.startswith(("http://", "https://")) and cleaned not in urls:
+            urls.append(cleaned)
+    return urls
 
 
 def handoff_kind(
