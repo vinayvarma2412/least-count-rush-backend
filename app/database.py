@@ -14,12 +14,17 @@ if not DATABASE_URL:
 
 # Create the async engine
 # pool_size and max_overflow can be adjusted based on load and Supabase PgBouncer limits
+engine_kwargs = {
+    "echo": False,
+    "pool_pre_ping": True, # check connection before using
+}
+if not DATABASE_URL.startswith("sqlite"):
+    engine_kwargs["pool_size"] = 10
+    engine_kwargs["max_overflow"] = 20
+
 engine = create_async_engine(
     DATABASE_URL,
-    echo=False,
-    pool_pre_ping=True, # check connection before using
-    pool_size=10,
-    max_overflow=20
+    **engine_kwargs
 )
 
 # Create a sessionmaker that uses AsyncSession

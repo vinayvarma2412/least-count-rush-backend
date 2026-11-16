@@ -8,8 +8,11 @@ cd "$(dirname "$0")/.."
 
 # Load environment variables from .env
 if [ -f .env ]; then
-    # Parse .env ignoring comments and empty lines
-    export $(grep -v '^#' .env | xargs)
+    # Use 'set -a' / 'set +a' to safely source .env, handling multi-line values
+    set -a
+    # shellcheck source=.env
+    source .env
+    set +a
 fi
 
 if [ -z "$DATABASE_URL" ]; then

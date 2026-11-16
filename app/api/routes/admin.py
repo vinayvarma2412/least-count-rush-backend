@@ -9,7 +9,8 @@ import httpx
 
 from app.database import get_db_session
 from app.api.dependencies import get_admin_api_key, get_current_db_user, _require_admin
-from app.models.db_models import User, Message, MessageTypeEnum, UserDevice, Game, GamePlayer, GameResultEnum, GameTypeEnum, GameModeEnum, UserRoleEnum, LeaderboardSeason, AdImpression, AdPlacementEnum
+from app.models.db_models import User, Message, MessageTypeEnum, UserDevice, Game, GamePlayer, GameResultEnum, GameTypeEnum, GameModeEnum, UserRoleEnum, LeaderboardSeason, AdImpression, AdPlacementEnum, IapTransaction
+from app.services.iap_catalog import canonicalize_plan_id
 from app.services import fcm_service
 from app.services.redis_client import redis_client
 from app.services.admob_reporting_service import admob_reporting_service
@@ -33,6 +34,10 @@ class AdminStatsGamesResponse(BaseModel):
     games_offline_today: int
     games_in_progress_online: int
     games_in_progress_offline: int
+    games_public_today: int = 0
+    games_private_today: int = 0
+    games_in_progress_public: int = 0
+    games_in_progress_private: int = 0
 
 class AdminStatsMessagesResponse(BaseModel):
     unread_messages: int
@@ -105,6 +110,17 @@ async def get_dashboard_stats_games(
     )
     games_in_progress_online = games_in_progress_online_result.scalar() or 0
 
+    games_in_progress_public_result = await db.execute(
+        select(func.count()).where(
+            Game.result == GameResultEnum.in_progress,
+            Game.game_type == GameTypeEnum.online,
+            Game.room_type == "public",
+            Game.entity_active == True,
+        )
+    )
+    games_in_progress_public = games_in_progress_public_result.scalar() or 0
+    games_in_progress_private = max(0, games_in_progress_online - games_in_progress_public)
+
     games_in_progress_offline_result = await db.execute(
         select(func.count()).where(
             Game.result == GameResultEnum.in_progress,
@@ -114,22 +130,39 @@ async def get_dashboard_stats_games(
     )
     games_in_progress_offline = games_in_progress_offline_result.scalar() or 0
 
-    today = (datetime.now(timezone.utc) + timedelta(minutes=tz_offset)).date()
+    user_now = datetime.now(timezone.utc) + timedelta(minutes=tz_offset)
+    user_today_start = user_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start = user_today_start - timedelta(minutes=tz_offset)
+    tomorrow_start = today_start + timedelta(days=1)
     
     games_online_today_result = await db.execute(
         select(func.count()).where(
             Game.entity_active == True,
             Game.game_type == GameTypeEnum.online,
-            func.date(Game.crt_dt + timedelta(minutes=tz_offset)) == today,
+            Game.crt_dt >= today_start,
+            Game.crt_dt < tomorrow_start,
         )
     )
     games_online_today = games_online_today_result.scalar() or 0
+
+    games_public_today_result = await db.execute(
+        select(func.count()).where(
+            Game.entity_active == True,
+            Game.game_type == GameTypeEnum.online,
+            Game.room_type == "public",
+            Game.crt_dt >= today_start,
+            Game.crt_dt < tomorrow_start,
+        )
+    )
+    games_public_today = games_public_today_result.scalar() or 0
+    games_private_today = max(0, games_online_today - games_public_today)
 
     games_offline_today_result = await db.execute(
         select(func.count()).where(
             Game.entity_active == True,
             Game.game_type == GameTypeEnum.offline,
-            func.date(Game.crt_dt + timedelta(minutes=tz_offset)) == today,
+            Game.crt_dt >= today_start,
+            Game.crt_dt < tomorrow_start,
         )
     )
     games_offline_today = games_offline_today_result.scalar() or 0
@@ -139,6 +172,10 @@ async def get_dashboard_stats_games(
         games_offline_today=games_offline_today,
         games_in_progress_online=games_in_progress_online,
         games_in_progress_offline=games_in_progress_offline,
+        games_public_today=games_public_today,
+        games_private_today=games_private_today,
+        games_in_progress_public=games_in_progress_public,
+        games_in_progress_private=games_in_progress_private,
     )
 
 
@@ -210,14 +247,13 @@ async def get_dashboard_stats_ads(
 @firebase_router.get("/dashboard/stats/earnings", response_model=AdminStatsEarningsResponse)
 async def get_dashboard_stats_earnings(
     tz_offset: int = Query(0, description="Timezone offset in minutes"),
+    force_refresh: bool = Query(False, description="Bypass cache and force fresh AdMob fetch"),
     current_user: User = Depends(_require_admin),
 ):
     try:
-        import asyncio
-        earnings_today, earnings_month = await asyncio.gather(
-            admob_reporting_service.get_earnings_today(tz_offset),
-            admob_reporting_service.get_earnings_this_month(tz_offset)
-        )
+        overview = await admob_reporting_service.get_earnings_overview(tz_offset, force_refresh=force_refresh)
+        earnings_today = overview.get("today", {"total": 0.0, "ios": 0.0, "android": 0.0})
+        earnings_month = overview.get("month", {"total": 0.0, "ios": 0.0, "android": 0.0})
     except Exception as e:
         logger.error(f"Failed to fetch admob earnings: {e}")
         earnings_today, earnings_month = {"total": 0.0, "ios": 0.0, "android": 0.0}, {"total": 0.0, "ios": 0.0, "android": 0.0}
@@ -238,10 +274,13 @@ class AdminStatsDetailedEarningsResponse(BaseModel):
 @firebase_router.get("/dashboard/stats/earnings/detailed", response_model=AdminStatsDetailedEarningsResponse)
 async def get_dashboard_stats_earnings_detailed(
     tz_offset: int = Query(0, description="Timezone offset in minutes"),
+    force_refresh: bool = Query(False, description="Bypass cache and force fresh AdMob fetch"),
     current_user: User = Depends(_require_admin),
 ):
     try:
-        detailed_data = await admob_reporting_service.get_detailed_earnings_this_month(tz_offset)
+        detailed_data = await admob_reporting_service.get_detailed_earnings_this_month(
+            tz_offset, force_refresh=force_refresh
+        )
         return AdminStatsDetailedEarningsResponse(
             unit_wise=[EarningItem(**item) for item in detailed_data.get("unit_wise", [])],
             country_wise=[EarningItem(**item) for item in detailed_data.get("country_wise", [])]
@@ -249,6 +288,496 @@ async def get_dashboard_stats_earnings_detailed(
     except Exception as e:
         logger.error(f"Failed to fetch detailed admob earnings: {e}")
         return AdminStatsDetailedEarningsResponse()
+
+
+# ── In-App Purchases / Subscriptions Dashboard & Detailed Listing ─────────────
+
+DEFAULT_PLAN_PRICES = {
+    "yearly": {"usd": 4.99, "inr": 399.0},
+    "halfyearly": {"usd": 2.99, "inr": 249.0},
+    "quarterly": {"usd": 1.99, "inr": 149.0},
+    "monthly": {"usd": 0.99, "inr": 59.0},
+}
+USD_TO_INR_RATE = 84.0
+
+def _extract_price_and_currency(
+    platform: str,
+    normalized_plan: str,
+    store_payload: Optional[Dict[str, Any]] = None,
+) -> tuple[float, str, float, str]:
+    """
+    Returns (price, currency, revenue_usd, formatted_price)
+    """
+    # 1. Try to extract from store_payload
+    if store_payload and isinstance(store_payload, dict):
+        # Apple payload (claims)
+        claims = store_payload.get("claims") or (store_payload if "productId" in store_payload else {})
+        if isinstance(claims, dict):
+            raw_curr = claims.get("currency")
+            raw_price = claims.get("price")
+            if raw_price is not None:
+                try:
+                    p_num = float(raw_price)
+                    if p_num > 100:  # Apple uses milliunits e.g. 4990 for $4.99 or 399000 for ₹399
+                        p_num = p_num / 1000.0
+                    curr = str(raw_curr).upper() if raw_curr else "USD"
+                    if curr == "USD":
+                        rev_usd = p_num
+                        fmt = f"${p_num:.2f}"
+                    elif curr == "INR":
+                        rev_usd = p_num / USD_TO_INR_RATE
+                        fmt = f"₹{p_num:.0f}"
+                    else:
+                        rev_usd = p_num
+                        fmt = f"{curr} {p_num:.2f}"
+                    return p_num, curr, rev_usd, fmt
+                except (ValueError, TypeError):
+                    pass
+
+        # Google Play payload
+        line_items = store_payload.get("lineItems") or []
+        if isinstance(line_items, list) and line_items:
+            first_item = line_items[0] if isinstance(line_items[0], dict) else {}
+            offer = first_item.get("offerDetails") or {}
+            pricing_phases = offer.get("pricingPhases") or []
+            if isinstance(pricing_phases, list) and pricing_phases:
+                phase = pricing_phases[-1] if isinstance(pricing_phases[-1], dict) else {}
+                micros = phase.get("priceAmountMicros")
+                curr = phase.get("priceCurrencyCode")
+                if micros is not None:
+                    try:
+                        p_num = float(micros) / 1_000_000.0
+                        c = str(curr).upper() if curr else "USD"
+                        if c == "USD":
+                            rev_usd = p_num
+                            fmt = f"${p_num:.2f}"
+                        elif c == "INR":
+                            rev_usd = p_num / USD_TO_INR_RATE
+                            fmt = f"₹{p_num:.0f}"
+                        else:
+                            rev_usd = p_num
+                            fmt = f"{c} {p_num:.2f}"
+                        return p_num, c, rev_usd, fmt
+                    except (ValueError, TypeError):
+                        pass
+
+    # 2. Fallback to predefined catalog plan prices
+    plan_info = DEFAULT_PLAN_PRICES.get(normalized_plan, DEFAULT_PLAN_PRICES["monthly"])
+    usd_price = plan_info["usd"]
+    return usd_price, "USD", usd_price, f"${usd_price:.2f}"
+
+def _normalize_plan_id(plan_id: Optional[str], product_id: Optional[str] = None) -> str:
+    canonical = canonicalize_plan_id(plan_id)
+    if canonical:
+        return canonical
+    text = (plan_id or product_id or "").lower()
+    if "year" in text or "12month" in text or "p1y" in text:
+        return "yearly"
+    if "half" in text or "6month" in text or "p6m" in text:
+        return "halfyearly"
+    if "quarter" in text or "3month" in text or "p3m" in text:
+        return "quarterly"
+    if "month" in text or "1month" in text or "p1m" in text:
+        return "monthly"
+    return "other"
+
+def _get_month_bounds(tz_offset_minutes: int, year: Optional[int] = None, month: Optional[int] = None):
+    from datetime import timedelta
+    now_utc = datetime.now(timezone.utc)
+    user_now = now_utc + timedelta(minutes=tz_offset_minutes)
+
+    if year is not None and month is not None:
+        user_month_start = datetime(year, month, 1, 0, 0, 0, tzinfo=timezone.utc)
+    else:
+        user_month_start = user_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    month_start_utc = user_month_start - timedelta(minutes=tz_offset_minutes)
+
+    if user_month_start.month == 12:
+        user_next_month_start = user_month_start.replace(year=user_month_start.year + 1, month=1)
+    else:
+        user_next_month_start = user_month_start.replace(month=user_month_start.month + 1)
+
+    month_end_utc = user_next_month_start - timedelta(minutes=tz_offset_minutes)
+    return month_start_utc, month_end_utc, user_month_start
+
+class MonthlyIapPlanCount(BaseModel):
+    month_key: str          # e.g. "2026-11"
+    month_name: str         # e.g. "Nov 2026"
+    yearly: int = 0
+    half_yearly: int = 0
+    quarterly: int = 0
+    monthly: int = 0
+    total: int = 0
+    revenue: float = 0.0
+    revenue_inr: float = 0.0
+
+class AdminStatsIapResponse(BaseModel):
+    total_this_month: int = 0
+    yearly: int = 0
+    half_yearly: int = 0
+    quarterly: int = 0
+    monthly: int = 0
+    android_count: int = 0
+    ios_count: int = 0
+    active_subscriptions: int = 0
+    total_revenue_this_month: float = 0.0
+    total_revenue_this_month_inr: float = 0.0
+    revenue_android_this_month: float = 0.0
+    revenue_ios_this_month: float = 0.0
+    monthly_history: List[MonthlyIapPlanCount] = []
+
+class AdminIapSubscriptionUser(BaseModel):
+    user_idn: int
+    user_id: Optional[str] = None
+    email: Optional[str] = None
+    user_name: Optional[str] = None
+    display_name: Optional[str] = None
+    avatar_seed: Optional[str] = None
+
+class AdminIapSubscriptionItem(BaseModel):
+    iap_transaction_idn: int
+    user: Optional[AdminIapSubscriptionUser] = None
+    platform: str
+    product_id: str
+    plan_id: Optional[str] = None
+    normalized_plan: str
+    store_transaction_id: str
+    original_transaction_id: Optional[str] = None
+    verification_status: str
+    source: str
+    environment: Optional[str] = None
+    purchase_dt: Optional[datetime] = None
+    expires_dt: Optional[datetime] = None
+    is_active: bool = False
+    acknowledged: bool = False
+    error_message: Optional[str] = None
+    store_payload: Optional[Dict[str, Any]] = None
+    crt_dt: Optional[datetime] = None
+    upd_dt: Optional[datetime] = None
+    price: float = 0.0
+    currency: str = "USD"
+    formatted_price: str = "$0.00"
+    revenue_usd: float = 0.0
+
+class AdminIapSubscriptionsResponse(BaseModel):
+    total_count: int = 0
+    filtered_count: int = 0
+    yearly_count: int = 0
+    half_yearly_count: int = 0
+    quarterly_count: int = 0
+    monthly_count: int = 0
+    total_revenue: float = 0.0
+    total_revenue_inr: float = 0.0
+    filtered_revenue: float = 0.0
+    filtered_revenue_inr: float = 0.0
+    subscriptions: List[AdminIapSubscriptionItem] = []
+    available_months: List[str] = []
+
+@firebase_router.get("/dashboard/stats/iap", response_model=AdminStatsIapResponse)
+async def get_dashboard_stats_iap(
+    tz_offset: int = Query(0, description="Timezone offset in minutes"),
+    current_user: User = Depends(_require_admin),
+    db: AsyncSession = Depends(get_db_session),
+):
+    from datetime import timedelta
+    now_utc = datetime.now(timezone.utc)
+    month_start_utc, month_end_utc, user_month_start = _get_month_bounds(tz_offset)
+
+    # Active subscriptions total
+    active_stmt = select(func.count()).where(
+        IapTransaction.verification_status == "verified",
+        or_(
+            IapTransaction.expires_dt == None,
+            IapTransaction.expires_dt > now_utc,
+        ),
+    )
+    active_subscriptions = (await db.execute(active_stmt)).scalar() or 0
+
+    # Fetch last 6 months of transactions
+    six_months_ago_utc = month_start_utc - timedelta(days=185)
+    txn_date_expr = func.coalesce(IapTransaction.purchase_dt, IapTransaction.crt_dt)
+
+    stmt = (
+        select(
+            IapTransaction.plan_id,
+            IapTransaction.product_id,
+            IapTransaction.platform,
+            IapTransaction.verification_status,
+            IapTransaction.store_payload,
+            txn_date_expr.label("txn_dt"),
+        )
+        .where(
+            txn_date_expr >= six_months_ago_utc,
+            IapTransaction.verification_status.in_(["verified", "expired"]),
+        )
+    )
+    res = await db.execute(stmt)
+    rows = res.all()
+
+    # Pre-build 6 months list
+    monthly_buckets: Dict[str, MonthlyIapPlanCount] = {}
+    month_keys_order = []
+    temp_dt = user_month_start
+    for _ in range(6):
+        m_key = temp_dt.strftime("%Y-%m")
+        m_name = temp_dt.strftime("%b %Y")
+        month_keys_order.append(m_key)
+        monthly_buckets[m_key] = MonthlyIapPlanCount(
+            month_key=m_key,
+            month_name=m_name,
+        )
+        if temp_dt.month == 1:
+            temp_dt = temp_dt.replace(year=temp_dt.year - 1, month=12)
+        else:
+            temp_dt = temp_dt.replace(month=temp_dt.month - 1)
+
+    this_month_key = user_month_start.strftime("%Y-%m")
+    android_count = 0
+    ios_count = 0
+    total_revenue_this_month = 0.0
+    total_revenue_this_month_inr = 0.0
+    revenue_android_this_month = 0.0
+    revenue_ios_this_month = 0.0
+
+    for r in rows:
+        r_dt = r.txn_dt
+        if r_dt.tzinfo is None:
+            r_dt = r_dt.replace(tzinfo=timezone.utc)
+        r_user_dt = r_dt + timedelta(minutes=tz_offset)
+        r_month_key = r_user_dt.strftime("%Y-%m")
+
+        plan = _normalize_plan_id(r.plan_id, r.product_id)
+        price, curr, rev_usd, fmt_price = _extract_price_and_currency(
+            r.platform, plan, getattr(r, "store_payload", None)
+        )
+
+        if r_month_key in monthly_buckets:
+            bucket = monthly_buckets[r_month_key]
+            bucket.total += 1
+            bucket.revenue = round(bucket.revenue + rev_usd, 2)
+            bucket.revenue_inr = round(bucket.revenue_inr + (rev_usd * USD_TO_INR_RATE), 2)
+            if plan == "yearly":
+                bucket.yearly += 1
+            elif plan == "halfyearly":
+                bucket.half_yearly += 1
+            elif plan == "quarterly":
+                bucket.quarterly += 1
+            elif plan == "monthly":
+                bucket.monthly += 1
+
+        if r_month_key == this_month_key:
+            total_revenue_this_month += rev_usd
+            total_revenue_this_month_inr += (rev_usd * USD_TO_INR_RATE)
+            if r.platform == "android":
+                android_count += 1
+                revenue_android_this_month += rev_usd
+            elif r.platform == "ios":
+                ios_count += 1
+                revenue_ios_this_month += rev_usd
+
+    this_month_bucket = monthly_buckets.get(
+        this_month_key,
+        MonthlyIapPlanCount(month_key=this_month_key, month_name=user_month_start.strftime("%b %Y")),
+    )
+
+    return AdminStatsIapResponse(
+        total_this_month=this_month_bucket.total,
+        yearly=this_month_bucket.yearly,
+        half_yearly=this_month_bucket.half_yearly,
+        quarterly=this_month_bucket.quarterly,
+        monthly=this_month_bucket.monthly,
+        android_count=android_count,
+        ios_count=ios_count,
+        active_subscriptions=active_subscriptions,
+        total_revenue_this_month=round(total_revenue_this_month, 2),
+        total_revenue_this_month_inr=round(total_revenue_this_month_inr, 2),
+        revenue_android_this_month=round(revenue_android_this_month, 2),
+        revenue_ios_this_month=round(revenue_ios_this_month, 2),
+        monthly_history=[monthly_buckets[k] for k in month_keys_order],
+    )
+
+
+@firebase_router.get("/dashboard/iap/subscriptions", response_model=AdminIapSubscriptionsResponse)
+async def get_admin_iap_subscriptions(
+    tz_offset: int = Query(0, description="Timezone offset in minutes"),
+    month: Optional[str] = Query(None, description="'this_month', 'all', or 'YYYY-MM'"),
+    plan: Optional[str] = Query(None, description="'all', 'yearly', 'halfyearly', 'quarterly', 'monthly'"),
+    platform: Optional[str] = Query(None, description="'all', 'android', 'ios'"),
+    status: Optional[str] = Query(None, description="'all', 'verified', 'expired', 'refunded', 'pending', 'rejected'"),
+    search: Optional[str] = Query(None, description="Search in username, display name, email, or transaction id"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    current_user: User = Depends(_require_admin),
+    db: AsyncSession = Depends(get_db_session),
+):
+    now_utc = datetime.now(timezone.utc)
+    txn_date_expr = func.coalesce(IapTransaction.purchase_dt, IapTransaction.crt_dt)
+
+    # Normalize parameters if called directly in tests
+    month_val = (month if isinstance(month, str) else "this_month") or "this_month"
+    month_val = month_val.strip().lower()
+    platform_val = platform if isinstance(platform, str) else None
+    status_val = status if isinstance(status, str) else None
+    search_val = search if isinstance(search, str) else None
+    plan_filter = (plan if isinstance(plan, str) else "all") or "all"
+    plan_filter = plan_filter.strip().lower()
+    limit_val = limit if isinstance(limit, int) else 100
+    offset_val = offset if isinstance(offset, int) else 0
+
+    base_stmt = (
+        select(IapTransaction, User)
+        .outerjoin(User, IapTransaction.user_idn == User.user_idn)
+    )
+
+    if month_val == "this_month":
+        month_start_utc, month_end_utc, _ = _get_month_bounds(tz_offset)
+        base_stmt = base_stmt.where(txn_date_expr >= month_start_utc, txn_date_expr < month_end_utc)
+    elif month_val != "all":
+        try:
+            parts = month_val.split("-")
+            y, m = int(parts[0]), int(parts[1])
+            month_start_utc, month_end_utc, _ = _get_month_bounds(tz_offset, year=y, month=m)
+            base_stmt = base_stmt.where(txn_date_expr >= month_start_utc, txn_date_expr < month_end_utc)
+        except Exception:
+            pass
+
+    if platform_val and platform_val.lower() not in ("all", ""):
+        base_stmt = base_stmt.where(IapTransaction.platform == platform_val.lower())
+
+    if status_val and status_val.lower() not in ("all", ""):
+        base_stmt = base_stmt.where(IapTransaction.verification_status == status_val.lower())
+
+    if search_val and search_val.strip():
+        q = f"%{search_val.strip()}%"
+        base_stmt = base_stmt.where(
+            or_(
+                User.user_name.ilike(q),
+                User.display_name.ilike(q),
+                User.email.ilike(q),
+                IapTransaction.store_transaction_id.ilike(q),
+                IapTransaction.original_transaction_id.ilike(q),
+            )
+        )
+
+    base_stmt = base_stmt.order_by(txn_date_expr.desc())
+
+    result = await db.execute(base_stmt)
+    all_matched = result.all()
+
+    total_count = len(all_matched)
+    yearly_count = 0
+    half_yearly_count = 0
+    quarterly_count = 0
+    monthly_count = 0
+    total_revenue = 0.0
+    total_revenue_inr = 0.0
+    filtered_revenue = 0.0
+    filtered_revenue_inr = 0.0
+
+    filtered_items: List[AdminIapSubscriptionItem] = []
+
+    for row in all_matched:
+        txn: IapTransaction = row[0]
+        user: Optional[User] = row[1]
+
+        norm_plan = _normalize_plan_id(txn.plan_id, txn.product_id)
+        price, curr, rev_usd, fmt_price = _extract_price_and_currency(
+            txn.platform, norm_plan, txn.store_payload
+        )
+
+        if txn.verification_status in ("verified", "expired"):
+            total_revenue += rev_usd
+            total_revenue_inr += rev_usd * USD_TO_INR_RATE
+
+        if norm_plan == "yearly":
+            yearly_count += 1
+        elif norm_plan == "halfyearly":
+            half_yearly_count += 1
+        elif norm_plan == "quarterly":
+            quarterly_count += 1
+        elif norm_plan == "monthly":
+            monthly_count += 1
+
+        if plan_filter != "all" and plan_filter != "":
+            if norm_plan != plan_filter:
+                continue
+
+        if txn.verification_status in ("verified", "expired"):
+            filtered_revenue += rev_usd
+            filtered_revenue_inr += rev_usd * USD_TO_INR_RATE
+
+        is_active = (
+            txn.verification_status == "verified"
+            and (txn.expires_dt is None or txn.expires_dt > now_utc)
+        )
+
+        user_info = None
+        if user:
+            user_info = AdminIapSubscriptionUser(
+                user_idn=user.user_idn,
+                user_id=user.user_id,
+                email=user.email,
+                user_name=user.user_name,
+                display_name=user.display_name,
+                avatar_seed=user.avatar_seed,
+            )
+
+        item = AdminIapSubscriptionItem(
+            iap_transaction_idn=txn.iap_transaction_idn,
+            user=user_info,
+            platform=txn.platform,
+            product_id=txn.product_id,
+            plan_id=txn.plan_id,
+            normalized_plan=norm_plan,
+            store_transaction_id=txn.store_transaction_id,
+            original_transaction_id=txn.original_transaction_id,
+            verification_status=txn.verification_status,
+            source=txn.source,
+            environment=txn.environment,
+            purchase_dt=txn.purchase_dt,
+            expires_dt=txn.expires_dt,
+            is_active=is_active,
+            acknowledged=txn.acknowledged,
+            error_message=txn.error_message,
+            store_payload=txn.store_payload,
+            crt_dt=txn.crt_dt,
+            upd_dt=txn.upd_dt,
+            price=price,
+            currency=curr,
+            formatted_price=fmt_price,
+            revenue_usd=round(rev_usd, 2),
+        )
+        filtered_items.append(item)
+
+    filtered_count = len(filtered_items)
+    paginated_items = filtered_items[offset_val : offset_val + limit_val]
+
+    _, _, cur_month = _get_month_bounds(tz_offset)
+    available_months = []
+    temp_m = cur_month
+    for _ in range(12):
+        available_months.append(temp_m.strftime("%Y-%m"))
+        if temp_m.month == 1:
+            temp_m = temp_m.replace(year=temp_m.year - 1, month=12)
+        else:
+            temp_m = temp_m.replace(month=temp_m.month - 1)
+
+    return AdminIapSubscriptionsResponse(
+        total_count=total_count,
+        filtered_count=filtered_count,
+        yearly_count=yearly_count,
+        half_yearly_count=half_yearly_count,
+        quarterly_count=quarterly_count,
+        monthly_count=monthly_count,
+        total_revenue=round(total_revenue, 2),
+        total_revenue_inr=round(total_revenue_inr, 2),
+        filtered_revenue=round(filtered_revenue, 2),
+        filtered_revenue_inr=round(filtered_revenue_inr, 2),
+        subscriptions=paginated_items,
+        available_months=available_months,
+    )
+
 
 class AdminReplyRequest(BaseModel):
     admin_user_idn: int
@@ -823,6 +1352,7 @@ class AdminGameResponse(BaseModel):
     started_at: Optional[datetime]
     ended_at: Optional[datetime]
     score_limit: Optional[str] = None
+    room_type: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -869,7 +1399,8 @@ async def get_admin_game_details(
         "started_at": game_obj.started_at,
         "ended_at": game_obj.ended_at,
         "host_display_name": host_name,
-        "score_limit": game_obj.score_limit
+        "score_limit": game_obj.score_limit,
+        "room_type": game_obj.room_type or ("private" if game_obj.game_type == GameTypeEnum.online or str(game_obj.game_type) == "online" else None),
     }
     
     # 2. Fetch players
@@ -902,6 +1433,7 @@ async def get_admin_games(
     status: Optional[str] = None,
     mode: Optional[str] = None,
     type: Optional[str] = None,
+    room_type: Optional[str] = None,
     startDate: Optional[str] = None,
     endDate: Optional[str] = None,
     sortBy: str = "createdAt",
@@ -932,6 +1464,22 @@ async def get_admin_games(
             valid_types = [t for t in types if t in [e.value for e in GameTypeEnum]]
             if valid_types:
                 stmt = stmt.where(Game.game_type.in_(valid_types))
+
+    if room_type:
+        room_types = [rt.strip().lower() for rt in room_type.split(",") if rt.strip()]
+        if room_types:
+            clauses = []
+            if "public" in room_types:
+                clauses.append(Game.room_type == "public")
+            if "private" in room_types:
+                clauses.append(
+                    and_(
+                        Game.game_type == GameTypeEnum.online,
+                        or_(Game.room_type == "private", Game.room_type == None, Game.room_type != "public")
+                    )
+                )
+            if clauses:
+                stmt = stmt.where(or_(*clauses))
 
     if startDate:
         try:
@@ -976,7 +1524,8 @@ async def get_admin_games(
             "started_at": game_obj.started_at,
             "ended_at": game_obj.ended_at,
             "host_display_name": host_name,
-            "score_limit": game_obj.score_limit
+            "score_limit": game_obj.score_limit,
+            "room_type": game_obj.room_type or ("private" if game_obj.game_type == GameTypeEnum.online or str(game_obj.game_type) == "online" else None),
         })
     
     return response
