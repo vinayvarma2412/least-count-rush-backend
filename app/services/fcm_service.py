@@ -182,10 +182,39 @@ async def dispatch_notification(notification_idn: int, db: AsyncSession) -> bool
     """
     Load a Notification row from DB, fire FCM, update status.
 
+    Uses an atomic status check-and-claim to prevent race conditions and duplicate
+    pushes when multiple server instances or regions are running concurrently.
+
     Returns True if FCM delivery succeeded.
     """
     from app.models.db_models import Notification, NotifStatusEnum, UserDevice
     from datetime import datetime, timezone
+    from sqlalchemy import update
+
+    now = datetime.now(timezone.utc)
+
+    # 1. Atomically claim the notification (only if still pending)
+    # This ensures that in a multi-server or multi-region deployment, exactly one server dispatches it.
+    claim_stmt = (
+        update(Notification)
+        .where(
+            Notification.notification_idn == notification_idn,
+            Notification.status == NotifStatusEnum.pending,
+        )
+        .values(
+            status=NotifStatusEnum.sent,
+            upd_dt=now,
+        )
+    )
+    claim_result = await db.execute(claim_stmt)
+    await db.commit()
+
+    if claim_result.rowcount == 0:
+        logger.info(
+            "dispatch_notification_skipped_already_claimed",
+            extra={"notification_idn": notification_idn},
+        )
+        return False
 
     result = await db.execute(
         select(Notification).where(Notification.notification_idn == notification_idn)
@@ -222,9 +251,10 @@ async def dispatch_notification(notification_idn: int, db: AsyncSession) -> bool
     elif notif.receiver_user_topic:
         ok = send_to_topic(notif.receiver_user_topic, title, body, data)
 
-    # Update notification status
-    notif.status = NotifStatusEnum.sent if ok else NotifStatusEnum.failed
-    notif.upd_dt = datetime.now(timezone.utc)
-    await db.commit()
+    # If delivery failed, mark as failed
+    if not ok:
+        notif.status = NotifStatusEnum.failed
+        notif.upd_dt = datetime.now(timezone.utc)
+        await db.commit()
 
     return ok

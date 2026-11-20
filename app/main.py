@@ -37,9 +37,14 @@ async def lifespan(app: FastAPI):
             
     from app.services.bot_fill_service import bot_fill_loop, ensure_online_bot_role
     from app.services.ready_timeout_service import ready_timeout_loop
+    from app.config import settings
     await ensure_online_bot_role()
     asyncio.create_task(room_cleanup_task())
-    asyncio.create_task(notification_dispatch_task())
+    if settings.enable_notification_scheduler:
+        global_log.info("notification_scheduler_started", {"enabled": True})
+        asyncio.create_task(notification_dispatch_task())
+    else:
+        global_log.info("notification_scheduler_disabled", {"enabled": False})
     asyncio.create_task(bot_fill_loop())
     asyncio.create_task(ready_timeout_loop())
     yield
@@ -204,12 +209,14 @@ async def health_check():
         await asyncio.sleep(2.0)
         
     from app.services.redis_client import BACKEND_NAME, USE_REDIS
+    from app.config import settings
     return {
         "status": "healthy",
         "service": "Least Count Rush Backend",
         "version": "1.0.0",
         "cache_backend": BACKEND_NAME,
         "redis_enabled": USE_REDIS,
+        "notification_scheduler_enabled": settings.enable_notification_scheduler,
     }
 
 

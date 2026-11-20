@@ -2,6 +2,7 @@
 Configuration settings for the application
 """
 import os
+from pydantic import Field, AliasChoices
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,6 +16,15 @@ class Settings(BaseSettings):
     port: int = int(os.getenv("PORT", 8000))
     database_url: str = ""
     firebase_project_id: str = ""
+    enable_notification_scheduler: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "ENABLE_NOTIFICATION_SCHEDULER",
+            "enable_notification_scheduler",
+            "ENABLE_SCHEDULER",
+            "enable_scheduler",
+        ),
+    )
     admob_publisher_id: str = ""
     admob_client_id: str = ""
     admob_client_secret: str = ""

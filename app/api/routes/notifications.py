@@ -17,7 +17,7 @@ import logging
 from app.database import get_db_session, AsyncSessionLocal
 from app.api.dependencies import _require_admin
 from app.models.db_models import Notification, NotifStatusEnum
-from app.services import fcm_service
+from app.services import fcm_service, reengagement_service
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,41 @@ class NotificationResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class ReengagePreviewUser(BaseModel):
+    user_idn: int
+    display_name: str
+    last_game_played_at: Optional[str] = None
+    habitual_schedule_to: str
+
+
+class ReengagePreviewResponse(BaseModel):
+    total_eligible_users: int
+    reachable_users_count: int
+    users_without_token_count: int
+    days_inactive: int
+    cooldown_days: int
+    cutoff_time: str
+    sample_users: List[ReengagePreviewUser]
+
+
+class ReengageScheduleRequest(BaseModel):
+    title: str = "Ready for another round? 🃏"
+    description: Optional[str] = "Your cards are waiting! Jump into Least Count Rush now."
+    days_inactive: int = 1
+    time_strategy: str = "habitual"  # "habitual", "fixed_time", "immediate"
+    fixed_schedule_to: Optional[datetime] = None
+    cooldown_days: int = 2
+
+
+class ReengageScheduleResponse(BaseModel):
+    success: bool
+    scheduled_count: int
+    reachable_count: int
+    total_eligible_count: int
+    time_strategy: Optional[str] = None
+    message: str
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────
@@ -139,3 +174,38 @@ async def retry_notification(
     await fcm_service.dispatch_notification(notification_idn, db)
     await db.refresh(notif)
     return notif
+
+
+@router.get("/reengage/preview", response_model=ReengagePreviewResponse)
+async def preview_reengagement(
+    days_inactive: int = 1,
+    cooldown_days: int = 2,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Preview eligible inactive players and potential schedule times
+    before triggering re-engagement push notifications.
+    """
+    return await reengagement_service.get_reengagement_preview(
+        db, days_inactive=days_inactive, cooldown_days=cooldown_days
+    )
+
+
+@router.post("/reengage/schedule", response_model=ReengageScheduleResponse)
+async def schedule_reengagement(
+    req: ReengageScheduleRequest,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Schedule re-engagement push notifications for players who haven't played today
+    and whose last game was yesterday or earlier.
+    """
+    return await reengagement_service.schedule_reengagement_notifications(
+        db=db,
+        title=req.title,
+        description=req.description,
+        days_inactive=req.days_inactive,
+        time_strategy=req.time_strategy,
+        fixed_schedule_to=req.fixed_schedule_to,
+        cooldown_days=req.cooldown_days,
+    )
